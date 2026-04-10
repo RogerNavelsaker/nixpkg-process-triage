@@ -1,0 +1,424 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (no actual release)'
+        required: false
+        default: 'true'
+
+# Releases should not be cancelled mid-flight
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ==========================================================================
+  # Validate version consistency before building
+  # ==========================================================================
+  validate-version:
+    name: Validate Version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.extract.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: extract
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/v}"
+          else
+            # For workflow_dispatch, use VERSION file
+            version=$(cat VERSION | tr -d '\n')
+          fi
+          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "Extracted version: $version"
+
+      - name: Validate VERSION file matches
+        run: |
+          file_version=$(cat VERSION | tr -d '\n')
+          tag_version="${{ steps.extract.outputs.version }}"
+
+          echo "VERSION file: $file_version"
+          echo "Tag version:  $tag_version"
+
+          if [[ "$file_version" != "$tag_version" ]]; then
+            echo "::error::Version mismatch!"
+            echo "VERSION file contains: $file_version"
+            echo "Tag version is:        $tag_version"
+            exit 1
+          fi
+
+          echo "✓ Versions match: $tag_version"
+
+      - name: Validate pt script version
+        run: |
+          script_version=$(grep 'readonly VERSION=' pt | head -1 | sed 's/.*VERSION="\([^"]*\)".*/\1/')
+          tag_version="${{ steps.extract.outputs.version }}"
+
+          echo "pt script version: $script_version"
+          echo "Tag version:       $tag_version"
+
+          if [[ "$script_version" != "$tag_version" ]]; then
+            echo "::error::pt script version mismatch!"
+            exit 1
+          fi
+
+          echo "✓ pt script version matches"
+
+  # ==========================================================================
+  # Build pt-core for all platforms
+  # ==========================================================================
+  build-pt-core:
+    name: Build pt-core (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    needs: validate-version
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.cargo-target
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc builds (standard)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: pt-core-linux-x86_64
+            is_musl: false
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact_name: pt-core-linux-aarch64
+            is_musl: false
+          # musl builds (static, portable)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact_name: pt-core-linux-x86_64-musl
+            is_musl: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            artifact_name: pt-core-linux-aarch64-musl
+            is_musl: true
+          # macOS builds
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact_name: pt-core-macos-x86_64
+            is_musl: false
+          - os: macos-15
+            target: aarch64-apple-darwin
+            artifact_name: pt-core-macos-aarch64
+            is_musl: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Ensure Rust target is installed
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install musl tools (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install cross (for cross-compilation)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: taiki-e/install-action@cross
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "crates -> .cargo-target"
+          key: ${{ matrix.target }}
+
+      - name: Build release binary (native)
+        if: matrix.target != 'aarch64-unknown-linux-musl'
+        run: |
+          cargo build --release -p pt-core --target ${{ matrix.target }}
+
+      - name: Build release binary (cross)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          cross build --release -p pt-core --target ${{ matrix.target }}
+
+      - name: Verify static linking (musl)
+        if: matrix.is_musl && matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          echo "Checking if binary is statically linked..."
+          file "$CARGO_TARGET_DIR/${{ matrix.target }}/release/pt-core"
+          ldd_output=$(ldd "$CARGO_TARGET_DIR/${{ matrix.target }}/release/pt-core" 2>&1 || true)
+          if echo "$ldd_output" | grep -qE "not a dynamic executable|statically linked"; then
+            echo "✓ Binary is statically linked"
+          else
+            echo "::error::Binary is not statically linked!"
+            echo "$ldd_output"
+            exit 1
+          fi
+
+      - name: Verify binary version
+        if: matrix.target != 'aarch64-apple-darwin' && matrix.target != 'aarch64-unknown-linux-gnu' && matrix.target != 'aarch64-unknown-linux-musl'
+        run: |
+          binary_version=$("$CARGO_TARGET_DIR/${{ matrix.target }}/release/pt-core" --version | awk '{print $2}')
+          expected_version="${{ needs.validate-version.outputs.version }}"
+
+          echo "Binary version:   $binary_version"
+          echo "Expected version: $expected_version"
+
+          if [[ "$binary_version" != "$expected_version" ]]; then
+            echo "::error::Binary version mismatch!"
+            exit 1
+          fi
+
+          echo "✓ Binary version matches"
+
+      - name: Package binary
+        run: |
+          version="${{ needs.validate-version.outputs.version }}"
+          mkdir -p dist
+
+          # Copy binary
+          cp "$CARGO_TARGET_DIR/${{ matrix.target }}/release/pt-core" dist/
+
+          # Create tarball
+          cd dist
+          tar -czvf ${{ matrix.artifact_name }}-${version}.tar.gz pt-core
+          rm pt-core
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/*.tar.gz
+          retention-days: 7
+
+  # ==========================================================================
+  # Assemble release
+  # ==========================================================================
+  assemble-release:
+    name: Assemble Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [validate-version, build-pt-core]
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          version="${{ needs.validate-version.outputs.version }}"
+          mkdir -p release
+          mkdir -p skill/process-triage
+
+          # Copy wrapper and installer
+          cp pt release/
+          cp install.sh release/
+
+          # Package the optional Claude/Codex skill from the installer's canonical payload.
+          bash install.sh --emit-skill-payload > skill/process-triage/SKILL.md
+          tar -czf release/process-triage-skill.tar.gz -C skill process-triage
+
+          # Move all built binaries
+          for dir in artifacts/*/; do
+            if [ -d "$dir" ]; then
+              mv "$dir"/*.tar.gz release/ || true
+            fi
+          done
+
+          # List release contents
+          echo "Release contents:"
+          ls -la release/
+
+      - name: Inject release key fingerprint pins
+        run: |
+          cd release
+
+          if [[ -z "${{ secrets.RELEASE_SIGNING_KEY_PEM }}" ]]; then
+            echo "::warning::RELEASE_SIGNING_KEY_PEM secret not configured — skipping signing"
+            echo "SIGNING_AVAILABLE=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          echo "SIGNING_AVAILABLE=true" >> "$GITHUB_ENV"
+
+          key_file="$(mktemp)"
+          trap 'rm -f "$key_file"' EXIT
+          printf '%s\n' "${{ secrets.RELEASE_SIGNING_KEY_PEM }}" > "$key_file"
+          chmod 600 "$key_file"
+
+          # Export trusted public key and compute canonical DER fingerprint.
+          openssl pkey -in "$key_file" -pubout -out release-signing-public.pem
+          key_fp="$(
+            openssl pkey -pubin -in release-signing-public.pem -outform der \
+              | sha256sum \
+              | cut -d' ' -f1
+          )"
+          printf '%s\n' "$key_fp" > release-signing-public.pem.sha256
+
+          # Pin release artifacts to this fingerprint.
+          sed -i "s|^readonly DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT=.*$|readonly DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT=\"$key_fp\"|" install.sh
+          sed -i "s|^readonly DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT=.*$|readonly DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT=\"$key_fp\"|" pt
+
+          echo "Release key fingerprint: $key_fp"
+
+      - name: Generate checksums
+        run: |
+          cd release
+          sha256sum * > checksums.sha256
+          echo ""
+          echo "Checksums:"
+          cat checksums.sha256
+
+      - name: Sign release assets
+        if: env.SIGNING_AVAILABLE == 'true'
+        run: |
+          cd release
+
+          if [[ -z "${{ secrets.RELEASE_SIGNING_KEY_PEM }}" ]]; then
+            echo "::warning::Skipping signing — no key available"
+            exit 0
+          fi
+
+          key_file="$(mktemp)"
+          trap 'rm -f "$key_file"' EXIT
+          printf '%s\n' "${{ secrets.RELEASE_SIGNING_KEY_PEM }}" > "$key_file"
+          chmod 600 "$key_file"
+
+          actual_fp="$(
+            openssl pkey -pubin -in release-signing-public.pem -outform der \
+              | sha256sum \
+              | cut -d' ' -f1
+          )"
+          expected_fp="$(tr -d '[:space:]' < release-signing-public.pem.sha256)"
+          if [[ "$actual_fp" != "$expected_fp" ]]; then
+            echo "::error::release-signing-public.pem fingerprint mismatch"
+            echo "expected: $expected_fp"
+            echo "actual:   $actual_fp"
+            exit 1
+          fi
+
+          # Detached signatures for every distributable artifact.
+          for asset in *; do
+            case "$asset" in
+              *.sig|release-signing-public.pem)
+                continue
+                ;;
+            esac
+            openssl dgst -sha256 -sign "$key_file" -out "${asset}.sig" "$asset"
+          done
+
+          echo ""
+          echo "Signed assets:"
+          ls -la *.sig release-signing-public.pem release-signing-public.pem.sha256
+
+      - name: Generate release notes
+        run: |
+          version="${{ needs.validate-version.outputs.version }}"
+
+          cat > release-notes.md << 'NOTES'
+          ## Installation
+
+          ### Quick Install (recommended)
+          ```bash
+          curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/main/install.sh | bash
+          ```
+
+          ### Verify Installation
+          ```bash
+          VERIFY=1 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/main/install.sh | bash
+          ```
+
+          ### Manual Installation
+          1. Download the appropriate `pt-core-*` archive for your platform
+          2. Extract: `tar -xzf pt-core-*.tar.gz`
+          3. Move to PATH: `mv pt-core ~/.local/bin/`
+          4. Download `pt` wrapper and `install.sh`
+          5. Verify checksums: `sha256sum -c checksums.sha256`
+
+          ## Checksums
+          All release artifacts include SHA-256 checksums in `checksums.sha256`.
+
+          ## What's Included
+          - `pt` - Main bash wrapper for interactive use
+          - `install.sh` - Self-updating installer script
+          - `process-triage-skill.tar.gz` - Optional Claude/Codex skill payload
+          - `pt-core-*` - Platform-specific Rust binaries
+          - `checksums.sha256` - SHA-256 checksums for verification
+          NOTES
+
+          if [[ "${SIGNING_AVAILABLE:-false}" == "true" ]]; then
+            cat >> release-notes.md << 'SIGNED'
+          - `*.sig` - Detached ECDSA signatures for each artifact
+          - `release-signing-public.pem` - Trusted public key for signature verification
+          - `release-signing-public.pem.sha256` - Pinned SHA-256 fingerprint for the public key
+
+          ### Signature Verification
+          ```bash
+          openssl pkey -pubin -in release-signing-public.pem -outform der | sha256sum
+          # Compare against release-signing-public.pem.sha256
+          openssl dgst -sha256 -verify release-signing-public.pem -signature <artifact>.sig <artifact>
+          ```
+          SIGNED
+          fi
+
+          cat >> release-notes.md << 'PLATFORMS'
+
+          ## Supported Platforms
+          - Linux x86_64 (Intel/AMD 64-bit)
+          - Linux aarch64 (ARM 64-bit)
+          - Linux x86_64 musl (static, portable)
+          - Linux aarch64 musl (static, portable)
+          - macOS x86_64 (Intel Macs)
+          - macOS aarch64 (Apple Silicon)
+
+          ### Static/musl Binaries
+          The `-musl` variants are statically linked and work on any Linux distro,
+          including Alpine, older glibc systems, and minimal containers. Use these
+          for maximum portability.
+          PLATFORMS
+
+          echo "Release notes generated"
+
+      - name: Create GitHub Release
+        if: github.event_name == 'push' || github.event.inputs.dry_run != 'true'
+        uses: softprops/action-gh-release@v2.2.1
+        with:
+          name: v${{ needs.validate-version.outputs.version }}
+          body_path: release-notes.md
+          draft: false
+          prerelease: false
+          files: |
+            release/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload release artifacts (dry run)
+        if: github.event.inputs.dry_run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dry-run
+          path: release/
+          retention-days: 7

@@ -1,0 +1,338 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel in-progress runs when a new commit is pushed to the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  version-check:
+    name: Version Consistency
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check VERSION file exists
+        run: |
+          if [[ ! -f VERSION ]]; then
+            echo "::error::VERSION file not found"
+            exit 1
+          fi
+
+      - name: Verify version consistency
+        run: |
+          file_version=$(cat VERSION | tr -d '\n')
+          script_version=$(grep 'readonly VERSION=' pt | head -1 | sed 's/.*VERSION="\([^"]*\)".*/\1/')
+
+          echo "VERSION file: $file_version"
+          echo "pt script:    $script_version"
+
+          if [[ "$file_version" != "$script_version" ]]; then
+            echo ""
+            echo "::error::Version mismatch!"
+            echo "VERSION file contains: $file_version"
+            echo "pt script contains:    $script_version"
+            echo ""
+            echo "Please update both to match."
+            exit 1
+          fi
+
+          echo "✓ Versions match: $file_version"
+
+      - name: Validate version format
+        run: |
+          version=$(cat VERSION | tr -d '\n')
+
+          # Check semver format (X.Y.Z)
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid version format: $version"
+            echo "Expected: X.Y.Z (e.g., 1.2.3)"
+            exit 1
+          fi
+
+          echo "✓ Version format valid: $version"
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@2.0.0
+        with:
+          severity: warning
+          scandir: '.'
+          additional_files: 'pt install.sh'
+        env:
+          SHELLCHECK_OPTS: '-e SC2155 -e SC2034'
+
+  bash_syntax:
+    name: Bash Syntax
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate pt syntax
+        run: bash -n pt
+
+      - name: Validate install.sh syntax
+        run: |
+          if [ -f install.sh ]; then
+            bash -n install.sh
+          else
+            echo "install.sh not present; skipping"
+          fi
+
+      - name: Validate test files (best-effort)
+        run: |
+          for file in test/*.bats; do
+            if [ -f "$file" ]; then
+              echo "Checking $file..."
+              bash -n "$file" 2>/dev/null || true
+            fi
+          done
+
+  no_mock_policy:
+    name: No-Mock Policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run no-mock policy check
+        run: scripts/check_no_mocks.sh
+
+  manpages:
+    name: Man Pages
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install groff
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y groff-base
+
+      - name: Generate and check man pages
+        run: scripts/check_manpages.sh
+
+  rust_lint:
+    name: Rust Lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "crates -> target"
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run clippy (default features)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run clippy (all features)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  cargo_test:
+    name: Cargo Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "crates -> target"
+
+      - name: Run tests (default features)
+        run: cargo test --workspace --verbose
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Run tests (with test-utils feature)
+        run: cargo test --workspace --verbose --features test-utils
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Run tests (pt-core daemon feature)
+        if: runner.os == 'Linux'
+        run: cargo test -p pt-core --verbose --features daemon
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Run doc tests
+        run: cargo test --workspace --doc --verbose
+        env:
+          RUST_BACKTRACE: 1
+
+  tests:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Bash 5 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install bash
+          echo "/opt/homebrew/bin" >> $GITHUB_PATH
+          /opt/homebrew/bin/bash --version
+
+      - name: Install BATS
+        run: |
+          git clone --depth 1 https://github.com/bats-core/bats-core.git
+          cd bats-core
+          sudo ./install.sh /usr/local
+
+      - name: Install gum (for integration tests)
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo mkdir -p /etc/apt/keyrings
+            curl -fsSL https://repo.charm.sh/apt/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/charm.gpg
+            echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" | sudo tee /etc/apt/sources.list.d/charm.list
+            sudo apt update && sudo apt install -y gum
+          else
+            brew install gum
+          fi
+        continue-on-error: true
+
+      - name: Run BATS tests
+        run: |
+          bats --tap test/
+        env:
+          TERM: xterm-256color
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.os }}
+          path: test/
+          retention-days: 14
+
+  install-test:
+    name: Installation Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Bash 5 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install bash
+          echo "/opt/homebrew/bin" >> $GITHUB_PATH
+
+      - name: Run installer
+        run: |
+          # Run installer from local file (not curl, since we're testing the branch)
+          bash install.sh
+        env:
+          PT_NO_PATH: '1'  # Don't modify shell config in CI
+
+      - name: Verify installation
+        run: |
+          # Check executable exists
+          if [[ ! -x "$HOME/.local/bin/pt" ]]; then
+            echo "::error::pt not installed to expected location"
+            ls -la "$HOME/.local/bin/" || true
+            exit 1
+          fi
+
+          echo "✓ pt installed successfully"
+
+      - name: Test --version
+        run: |
+          version=$("$HOME/.local/bin/pt" --version)
+          echo "Version output: $version"
+
+          if [[ ! "$version" =~ ^pt\ version\ [0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Unexpected version output format"
+            exit 1
+          fi
+
+          echo "✓ --version works correctly"
+
+      - name: Test --help
+        run: |
+          help_output=$("$HOME/.local/bin/pt" --help)
+
+          # Check for expected content
+          if [[ "$help_output" != *"Process Triage"* ]]; then
+            echo "::error::Help output missing expected content"
+            exit 1
+          fi
+
+          if [[ "$help_output" != *"scan"* ]]; then
+            echo "::error::Help output missing 'scan' command"
+            exit 1
+          fi
+
+          echo "✓ --help works correctly"
+
+      - name: Test scan command
+        run: |
+          # scan should work (may find 0 candidates, that's OK)
+          "$HOME/.local/bin/pt" scan || {
+            echo "::error::pt scan failed"
+            exit 1
+          }
+          echo "✓ scan command works"
+        env:
+          CI: 'true'
+          NO_COLOR: '1'

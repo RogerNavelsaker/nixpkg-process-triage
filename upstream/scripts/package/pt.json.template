@@ -1,0 +1,37 @@
+{
+    "$schema": "https://raw.githubusercontent.com/ScoopInstaller/Scoop/main/schema.json",
+    "version": "{{VERSION}}",
+    "description": "Bayesian-inspired zombie/abandoned process detection and cleanup (WSL2)",
+    "homepage": "https://github.com/Dicklesworthstone/process_triage",
+    "license": "MIT",
+    "architecture": {
+        "64bit": {
+            "url": "{{URL_LINUX_X86_64}}",
+            "hash": "{{SHA256_LINUX_X86_64}}",
+            "extract_dir": ""
+        }
+    },
+    "bin": "pt-core",
+    "checkver": {
+        "github": "https://github.com/Dicklesworthstone/process_triage"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "{{AUTOUPDATE_URL_LINUX_X86_64}}"
+            }
+        }
+    },
+    "notes": [
+        "Process Triage - Bayesian zombie process detection",
+        "",
+        "NOTE: This is a Linux binary for use with WSL2 (Windows Subsystem for Linux).",
+        "Run from within a WSL2 terminal (e.g., Ubuntu on Windows).",
+        "",
+        "Quick start:",
+        "  pt-core scan      - Scan for zombie processes",
+        "  pt-core agent plan --format json  - Agent mode",
+        "",
+        "Documentation: https://github.com/Dicklesworthstone/process_triage"
+    ]
+}

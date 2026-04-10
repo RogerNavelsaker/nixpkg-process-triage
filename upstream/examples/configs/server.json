@@ -1,0 +1,209 @@
+{
+  "schema_version": "1.0.0",
+  "policy_id": "preset:server",
+  "description": "Server preset: conservative detection for production environments",
+  "created_at": null,
+  "updated_at": null,
+  "inherits": [],
+  "loss_matrix": {
+    "useful": {
+      "keep": 0.0,
+      "pause": 1.0,
+      "throttle": 2.0,
+      "kill": 1000.0,
+      "restart": 50.0,
+      "renice": 0.5
+    },
+    "useful_bad": {
+      "keep": 0.0,
+      "pause": 0.5,
+      "throttle": 1.0,
+      "kill": 200.0,
+      "restart": 20.0,
+      "renice": 0.3
+    },
+    "abandoned": {
+      "keep": 3.0,
+      "pause": 0.3,
+      "throttle": 0.5,
+      "kill": 0.5,
+      "restart": 2.0,
+      "renice": 0.2
+    },
+    "zombie": {
+      "keep": 2.0,
+      "pause": 0.2,
+      "throttle": 0.2,
+      "kill": 0.2,
+      "restart": 0.5,
+      "renice": 0.1
+    }
+  },
+  "guardrails": {
+    "protected_patterns": [
+      {
+        "pattern": "^systemd",
+        "kind": "regex",
+        "case_insensitive": true,
+        "notes": "Init system and services"
+      },
+      {
+        "pattern": "^sshd$",
+        "kind": "regex",
+        "case_insensitive": true,
+        "notes": "SSH daemon"
+      },
+      {
+        "pattern": "^nginx$",
+        "kind": "regex",
+        "case_insensitive": true,
+        "notes": "Web server"
+      },
+      {
+        "pattern": "^postgres",
+        "kind": "regex",
+        "case_insensitive": true,
+        "notes": "PostgreSQL"
+      },
+      {
+        "pattern": "^mysql",
+        "kind": "regex",
+        "case_insensitive": true,
+        "notes": "MySQL"
+      },
+      {
+        "pattern": "^redis",
+        "kind": "regex",
+        "case_insensitive": true,
+        "notes": "Redis"
+      },
+      {
+        "pattern": "^docker",
+        "kind": "regex",
+        "case_insensitive": true,
+        "notes": "Docker daemon"
+      },
+      {
+        "pattern": "^containerd",
+        "kind": "regex",
+        "case_insensitive": true,
+        "notes": "Container runtime"
+      },
+      {
+        "pattern": "^kubelet",
+        "kind": "regex",
+        "case_insensitive": true,
+        "notes": "Kubernetes node agent"
+      },
+      {
+        "pattern": "^cron",
+        "kind": "regex",
+        "case_insensitive": true,
+        "notes": "Cron scheduler"
+      }
+    ],
+    "force_review_patterns": [
+      {
+        "pattern": "worker",
+        "kind": "literal",
+        "case_insensitive": true,
+        "notes": "Background workers"
+      },
+      {
+        "pattern": "queue",
+        "kind": "literal",
+        "case_insensitive": true,
+        "notes": "Queue processors"
+      }
+    ],
+    "protected_users": [
+      "root"
+    ],
+    "protected_groups": [],
+    "protected_categories": [
+      "database",
+      "webserver",
+      "container",
+      "init"
+    ],
+    "never_kill_ppid": [
+      1
+    ],
+    "never_kill_pid": [],
+    "max_kills_per_run": 5,
+    "max_kills_per_minute": 2,
+    "max_kills_per_hour": 10,
+    "max_kills_per_day": 30,
+    "min_process_age_seconds": 14400,
+    "require_confirmation": true
+  },
+  "robot_mode": {
+    "enabled": false,
+    "min_posterior": 0.99,
+    "min_confidence": "high",
+    "max_blast_radius_mb": 2048.0,
+    "max_kills": 3,
+    "require_known_signature": true,
+    "require_policy_snapshot": true,
+    "allow_categories": [],
+    "exclude_categories": [
+      "database",
+      "webserver",
+      "container"
+    ],
+    "require_human_for_supervised": true
+  },
+  "signature_fast_path": {
+    "enabled": true,
+    "min_confidence_threshold": 0.9,
+    "require_explicit_priors": true
+  },
+  "fdr_control": {
+    "enabled": true,
+    "method": "by",
+    "alpha": 0.01,
+    "min_candidates": 3,
+    "lfdr_null": [],
+    "alpha_investing": {
+      "w0": 0.01,
+      "alpha_spend": 0.001,
+      "alpha_earn": 0.005
+    }
+  },
+  "data_loss_gates": {
+    "block_if_open_write_fds": true,
+    "max_open_write_fds": null,
+    "block_if_locked_files": true,
+    "block_if_deleted_cwd": true,
+    "block_if_active_tty": true,
+    "block_if_recent_io_seconds": 300
+  },
+  "load_aware": {
+    "enabled": true,
+    "queue_high": 100,
+    "load_per_core_high": 0.8,
+    "memory_used_fraction_high": 0.9,
+    "psi_avg10_high": 30.0,
+    "weights": {
+      "queue": 0.25,
+      "load": 0.35,
+      "memory": 0.25,
+      "psi": 0.15
+    },
+    "multipliers": {
+      "keep_max": 1.4,
+      "reversible_min": 0.6,
+      "risky_max": 1.8
+    }
+  },
+  "decision_time_bound": {
+    "enabled": true,
+    "min_seconds": 120,
+    "max_seconds": 900,
+    "voi_decay_half_life_seconds": 180,
+    "voi_floor": 0.02,
+    "overhead_budget_seconds": 600,
+    "fallback_action": "keep"
+  },
+  "notes": "Recommended for production servers - prioritizes safety over cleanup"
+}

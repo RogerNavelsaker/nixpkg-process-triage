@@ -1,0 +1,73 @@
+{
+  "schema_version": "1.0.0",
+  "description": "Test fixture priors for unit tests",
+  "classes": {
+    "useful": {
+      "prior_prob": 0.70,
+      "cpu_beta": { "alpha": 5.0, "beta": 3.0 },
+      "runtime_gamma": { "shape": 2.0, "rate": 0.0001 },
+      "orphan_beta": { "alpha": 1.0, "beta": 20.0 },
+      "tty_beta": { "alpha": 8.0, "beta": 2.0 },
+      "net_beta": { "alpha": 5.0, "beta": 3.0 },
+      "io_active_beta": { "alpha": 6.0, "beta": 2.0 }
+    },
+    "useful_bad": {
+      "prior_prob": 0.05,
+      "cpu_beta": { "alpha": 9.0, "beta": 1.0 },
+      "runtime_gamma": { "shape": 1.5, "rate": 0.00005 },
+      "orphan_beta": { "alpha": 2.0, "beta": 8.0 },
+      "tty_beta": { "alpha": 4.0, "beta": 4.0 },
+      "net_beta": { "alpha": 3.0, "beta": 5.0 },
+      "io_active_beta": { "alpha": 2.0, "beta": 6.0 }
+    },
+    "abandoned": {
+      "prior_prob": 0.20,
+      "cpu_beta": { "alpha": 1.0, "beta": 8.0 },
+      "runtime_gamma": { "shape": 1.0, "rate": 0.00001 },
+      "orphan_beta": { "alpha": 6.0, "beta": 2.0 },
+      "tty_beta": { "alpha": 1.0, "beta": 8.0 },
+      "net_beta": { "alpha": 1.0, "beta": 6.0 },
+      "io_active_beta": { "alpha": 1.0, "beta": 10.0 }
+    },
+    "zombie": {
+      "prior_prob": 0.05,
+      "cpu_beta": { "alpha": 1.0, "beta": 100.0 },
+      "runtime_gamma": { "shape": 0.5, "rate": 0.00001 },
+      "orphan_beta": { "alpha": 10.0, "beta": 1.0 },
+      "tty_beta": { "alpha": 1.0, "beta": 20.0 },
+      "net_beta": { "alpha": 1.0, "beta": 50.0 },
+      "io_active_beta": { "alpha": 1.0, "beta": 100.0 }
+    }
+  },
+  "state_flags": {
+    "flag_names": ["Running", "Sleeping", "DiskSleep", "Zombie", "Stopped", "Idle", "Dead"],
+    "useful": { "alpha": [5.0, 5.0, 2.0, 0.1, 1.0, 1.0, 0.1] },
+    "useful_bad": { "alpha": [2.0, 2.0, 5.0, 0.1, 2.0, 1.0, 0.1] },
+    "abandoned": { "alpha": [1.0, 8.0, 1.0, 0.1, 5.0, 5.0, 0.1] },
+    "zombie": { "alpha": [0.1, 0.1, 0.1, 100.0, 0.1, 0.1, 50.0] }
+  },
+  "hierarchical": {
+    "shrinkage_enabled": true,
+    "shrinkage_strength": 0.3
+  },
+  "command_categories": {
+    "_comment": "Dirichlet priors over 13 command categories: Test, DevServer, Agent, Server, Daemon, Build, Editor, Shell, Database, Vcs, PackageManager, Container, Unknown. Higher alpha = more likely for that class.",
+    "category_names": ["test", "devserver", "agent", "server", "daemon", "build", "editor", "shell", "database", "vcs", "package_manager", "container", "unknown"],
+    "useful": {
+      "_comment": "Useful processes span all categories, weighted toward servers and editors",
+      "alpha": [3.0, 4.0, 5.0, 8.0, 8.0, 3.0, 6.0, 4.0, 4.0, 3.0, 3.0, 5.0, 2.0]
+    },
+    "useful_bad": {
+      "_comment": "Runaway processes: tests, builds, agents more likely to go bad",
+      "alpha": [6.0, 3.0, 4.0, 2.0, 1.0, 5.0, 2.0, 3.0, 2.0, 1.0, 2.0, 2.0, 3.0]
+    },
+    "abandoned": {
+      "_comment": "Abandoned: tests, agents, dev servers often forgotten; servers/daemons rarely abandoned",
+      "alpha": [8.0, 5.0, 8.0, 1.0, 0.5, 4.0, 2.0, 4.0, 3.0, 2.0, 2.0, 3.0, 5.0]
+    },
+    "zombie": {
+      "_comment": "True zombies: extremely rare for most categories; only shell children and unknown can become zombies",
+      "alpha": [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 2.0, 0.1, 0.1, 0.1, 0.1, 1.0]
+    }
+  }
+}

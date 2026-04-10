@@ -1,0 +1,41 @@
+[workspace]
+members = [
+    "crates/pt-bundle",
+    "crates/pt-common",
+    "crates/pt-config",
+    "crates/pt-core",
+    "crates/pt-math",
+    "crates/pt-report",
+    "crates/pt-redact",
+    "crates/pt-telemetry",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Dicklesworthstone/process_triage"
+rust-version = "1.88"
+## NOTE: Raised to satisfy `toon` (edition 2024 + vergen-gix MSRV) dependency for TOON output support.
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+clap = { version = "4", features = ["derive", "env", "string"] }
+toon = { git = "https://github.com/Dicklesworthstone/toon_rust.git", rev = "35ec231f" }
+
+# Release profile optimized for size (used for musl builds)
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# Size-optimized release profile for distribution
+[profile.release-small]
+inherits = "release"
+opt-level = "s"

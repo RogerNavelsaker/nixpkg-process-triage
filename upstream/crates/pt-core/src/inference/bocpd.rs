@@ -1,0 +1,1344 @@
+//! Bayesian Online Change-Point Detection (BOCPD).
+//!
+//! Detects regime shifts in process behavior using run-length recursion
+//! with conjugate emission models.
+//!
+//! # Background
+//!
+//! BOCPD maintains a posterior distribution over the "run length" r_t,
+//! which is the time since the last change point. The algorithm updates
+//! this distribution online as new observations arrive.
+//!
+//! # Mathematical Foundation
+//!
+//! **Run-length Distribution**:
+//! ```text
+//! P(r_t | x_{1:t}) ∝ P(x_t | r_t, x_{r:t-1}) * P(r_t | r_{t-1}) * P(r_{t-1} | x_{1:t-1})
+//! ```
+//!
+//! **Transition Prior**:
+//! - P(r_t = 0) = H (hazard rate - prior probability of change)
+//! - P(r_t = r_{t-1} + 1) = 1 - H
+//!
+//! # Emission Models (Conjugate)
+//!
+//! - **Normal-Gamma**: For continuous observations (CPU/IO rates)
+//! - **Poisson-Gamma**: For count data (event counts)
+//! - **Beta-Bernoulli**: For binary states
+//!
+//! # Example
+//!
+//! ```
+//! use pt_core::inference::bocpd::{BocpdDetector, BocpdConfig, EmissionModel};
+//!
+//! // Create detector with Poisson-Gamma emission model
+//! let config = BocpdConfig {
+//!     hazard_rate: 0.01,  // 1% prior probability of change at each step
+//!     max_run_length: 200,
+//!     emission_model: EmissionModel::PoissonGamma { alpha: 1.0, beta: 1.0 },
+//! };
+//!
+//! let mut detector = BocpdDetector::new(config);
+//!
+//! // Process observations
+//! for obs in &[5.0, 6.0, 4.0, 5.0, 15.0, 14.0, 16.0] {
+//!     let result = detector.update(*obs);
+//!     if result.change_point_probability > 0.5 {
+//!         println!("Change point detected at step {}", result.step);
+//!     }
+//! }
+//! ```
+
+use pt_math::{log_gamma, log_sum_exp};
+use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use thiserror::Error;
+use tracing::warn;
+
+/// Errors from BOCPD.
+#[derive(Debug, Error)]
+pub enum BocpdError {
+    #[error("invalid hazard rate: {0} (must be in (0, 1))")]
+    InvalidHazardRate(f64),
+
+    #[error("invalid max run length: {0} (must be > 0)")]
+    InvalidMaxRunLength(usize),
+
+    #[error("invalid emission model parameter: {message}")]
+    InvalidEmissionParameter { message: String },
+
+    #[error("invalid observation: {0}")]
+    InvalidObservation(f64),
+}
+
+/// Emission model for BOCPD.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EmissionModel {
+    /// Normal-Gamma conjugate pair for continuous observations.
+    /// Prior: μ ~ Normal(mu0, 1/(kappa0 * τ)), τ ~ Gamma(alpha0, beta0)
+    NormalGamma {
+        /// Prior mean for μ
+        mu0: f64,
+        /// Prior precision scaling
+        kappa0: f64,
+        /// Gamma shape
+        alpha0: f64,
+        /// Gamma rate
+        beta0: f64,
+    },
+
+    /// Poisson-Gamma conjugate pair for count data.
+    /// Prior: λ ~ Gamma(alpha, beta)
+    PoissonGamma {
+        /// Gamma shape
+        alpha: f64,
+        /// Gamma rate
+        beta: f64,
+    },
+
+    /// Beta-Bernoulli conjugate pair for binary states.
+    /// Prior: p ~ Beta(alpha, beta)
+    BetaBernoulli {
+        /// Beta alpha
+        alpha: f64,
+        /// Beta beta
+        beta: f64,
+    },
+}
+
+impl Default for EmissionModel {
+    fn default() -> Self {
+        EmissionModel::PoissonGamma {
+            alpha: 1.0,
+            beta: 1.0,
+        }
+    }
+}
+
+/// Configuration for BOCPD.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BocpdConfig {
+    /// Hazard rate H: prior probability of a change point at each step.
+    /// Typically small, e.g., 0.01 for expected run length of 100.
+    #[serde(default = "default_hazard_rate")]
+    pub hazard_rate: f64,
+
+    /// Maximum run length to track. Older hypotheses are truncated.
+    #[serde(default = "default_max_run_length")]
+    pub max_run_length: usize,
+
+    /// Emission model for computing observation likelihoods.
+    #[serde(default)]
+    pub emission_model: EmissionModel,
+}
+
+fn default_hazard_rate() -> f64 {
+    0.01
+}
+
+fn default_max_run_length() -> usize {
+    1000
+}
+
+impl Default for BocpdConfig {
+    fn default() -> Self {
+        Self {
+            hazard_rate: default_hazard_rate(),
+            max_run_length: default_max_run_length(),
+            emission_model: EmissionModel::default(),
+        }
+    }
+}
+
+impl BocpdConfig {
+    /// Validate configuration parameters.
+    pub fn validate(&self) -> Result<(), BocpdError> {
+        if self.hazard_rate <= 0.0 || self.hazard_rate >= 1.0 {
+            return Err(BocpdError::InvalidHazardRate(self.hazard_rate));
+        }
+        if self.max_run_length == 0 {
+            return Err(BocpdError::InvalidMaxRunLength(self.max_run_length));
+        }
+        self.validate_emission_model()?;
+        Ok(())
+    }
+
+    fn validate_emission_model(&self) -> Result<(), BocpdError> {
+        match &self.emission_model {
+            EmissionModel::NormalGamma {
+                kappa0,
+                alpha0,
+                beta0,
+                ..
+            } => {
+                if *kappa0 <= 0.0 {
+                    return Err(BocpdError::InvalidEmissionParameter {
+                        message: format!("kappa0 must be > 0, got {}", kappa0),
+                    });
+                }
+                if *alpha0 <= 0.0 {
+                    return Err(BocpdError::InvalidEmissionParameter {
+                        message: format!("alpha0 must be > 0, got {}", alpha0),
+                    });
+                }
+                if *beta0 <= 0.0 {
+                    return Err(BocpdError::InvalidEmissionParameter {
+                        message: format!("beta0 must be > 0, got {}", beta0),
+                    });
+                }
+            }
+            EmissionModel::PoissonGamma { alpha, beta } => {
+                if *alpha <= 0.0 {
+                    return Err(BocpdError::InvalidEmissionParameter {
+                        message: format!("alpha must be > 0, got {}", alpha),
+                    });
+                }
+                if *beta <= 0.0 {
+                    return Err(BocpdError::InvalidEmissionParameter {
+                        message: format!("beta must be > 0, got {}", beta),
+                    });
+                }
+            }
+            EmissionModel::BetaBernoulli { alpha, beta } => {
+                if *alpha <= 0.0 {
+                    return Err(BocpdError::InvalidEmissionParameter {
+                        message: format!("alpha must be > 0, got {}", alpha),
+                    });
+                }
+                if *beta <= 0.0 {
+                    return Err(BocpdError::InvalidEmissionParameter {
+                        message: format!("beta must be > 0, got {}", beta),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Sufficient statistics for a run segment.
+#[derive(Debug, Clone)]
+enum SufficientStats {
+    NormalGamma {
+        n: f64,      // count
+        sum_x: f64,  // sum of observations
+        sum_x2: f64, // sum of squared observations
+        kappa: f64,  // updated kappa
+        mu: f64,     // updated mu
+        alpha: f64,  // updated alpha
+        beta: f64,   // updated beta
+    },
+    PoissonGamma {
+        n: f64,     // count
+        sum_x: f64, // sum of counts
+        alpha: f64, // updated alpha
+        beta: f64,  // updated beta
+    },
+    BetaBernoulli {
+        alpha: f64, // updated alpha (successes + prior)
+        beta: f64,  // updated beta (failures + prior)
+    },
+}
+
+impl SufficientStats {
+    fn new_normal_gamma(mu0: f64, kappa0: f64, alpha0: f64, beta0: f64) -> Self {
+        SufficientStats::NormalGamma {
+            n: 0.0,
+            sum_x: 0.0,
+            sum_x2: 0.0,
+            kappa: kappa0,
+            mu: mu0,
+            alpha: alpha0,
+            beta: beta0,
+        }
+    }
+
+    fn new_poisson_gamma(alpha: f64, beta: f64) -> Self {
+        SufficientStats::PoissonGamma {
+            n: 0.0,
+            sum_x: 0.0,
+            alpha,
+            beta,
+        }
+    }
+
+    fn new_beta_bernoulli(alpha: f64, beta: f64) -> Self {
+        SufficientStats::BetaBernoulli { alpha, beta }
+    }
+
+    /// Update sufficient statistics with a new observation.
+    fn update(&mut self, x: f64) {
+        match self {
+            SufficientStats::NormalGamma {
+                n,
+                sum_x,
+                sum_x2,
+                kappa,
+                mu,
+                alpha,
+                beta,
+            } => {
+                // Conjugate update for Normal-Gamma (Incremental)
+                // We update parameters directly from the previous posterior state.
+                let x_minus_mu = x - *mu;
+                let kappa_n = *kappa + 1.0;
+
+                let mu_n = (*kappa * *mu + x) / kappa_n;
+                let alpha_n = *alpha + 0.5;
+                let beta_n = *beta + (*kappa * x_minus_mu * x_minus_mu) / (2.0 * kappa_n);
+
+                // Update counts for record keeping (though not used for param update anymore)
+                *n += 1.0;
+                *sum_x += x;
+                *sum_x2 += x * x;
+
+                *kappa = kappa_n;
+                *mu = mu_n;
+                *alpha = alpha_n;
+                *beta = beta_n;
+            }
+            SufficientStats::PoissonGamma {
+                n,
+                sum_x,
+                alpha,
+                beta,
+            } => {
+                // Conjugate update for Poisson-Gamma
+                *n += 1.0;
+                *sum_x += x;
+                *alpha += x; // Add count to shape
+                *beta += 1.0; // Add one observation to rate
+            }
+            SufficientStats::BetaBernoulli { alpha, beta } => {
+                // Conjugate update for Beta-Bernoulli
+                // x should be 0 or 1
+                if x > 0.5 {
+                    *alpha += 1.0;
+                } else {
+                    *beta += 1.0;
+                }
+            }
+        }
+    }
+
+    /// Compute log predictive probability for a new observation.
+    fn log_predictive(&self, x: f64) -> f64 {
+        match self {
+            SufficientStats::NormalGamma {
+                kappa,
+                mu,
+                alpha,
+                beta,
+                ..
+            } => {
+                // Student-t predictive distribution
+                // x | data ~ Student-t(2*alpha, mu, beta*(kappa+1)/(alpha*kappa))
+                let nu = 2.0 * alpha;
+                let scale_sq = beta * (kappa + 1.0) / (alpha * kappa);
+                let scale = scale_sq.sqrt();
+
+                if scale <= 0.0 || !scale.is_finite() {
+                    return f64::NEG_INFINITY;
+                }
+
+                // Log PDF of Student-t
+                let z = (x - mu) / scale;
+                let log_gamma_half_nu_plus_half = log_gamma((nu + 1.0) / 2.0);
+                let log_gamma_half_nu = log_gamma(nu / 2.0);
+
+                if !log_gamma_half_nu_plus_half.is_finite() || !log_gamma_half_nu.is_finite() {
+                    return f64::NEG_INFINITY;
+                }
+
+                log_gamma_half_nu_plus_half
+                    - log_gamma_half_nu
+                    - 0.5 * (nu * std::f64::consts::PI).ln()
+                    - scale.ln()
+                    - ((nu + 1.0) / 2.0) * (1.0 + z * z / nu).ln()
+            }
+            SufficientStats::PoissonGamma { alpha, beta, .. } => {
+                // Negative binomial predictive distribution
+                // x | data ~ NegBin(alpha, beta/(beta+1))
+                let p = *beta / (*beta + 1.0);
+                let r = *alpha;
+
+                // Validate inputs for log_pmf
+                if x < 0.0 || r <= 0.0 || p <= 0.0 || p >= 1.0 {
+                    return f64::NEG_INFINITY;
+                }
+
+                // Log PMF of negative binomial
+                // P(x) = C(x+r-1, x) * p^r * (1-p)^x
+                let term1 = log_gamma(x + r);
+                let term2 = log_gamma(x + 1.0);
+                let term3 = log_gamma(r);
+
+                if !term1.is_finite() || !term2.is_finite() || !term3.is_finite() {
+                    return f64::NEG_INFINITY;
+                }
+
+                term1 - term2 - term3 + r * p.ln() + x * (1.0 - p).ln()
+            }
+            SufficientStats::BetaBernoulli { alpha, beta } => {
+                // Bernoulli predictive with posterior mean
+                // P(x=1 | data) = alpha / (alpha + beta)
+                let p = *alpha / (*alpha + *beta);
+                if x > 0.5 {
+                    p.ln()
+                } else {
+                    (1.0 - p).ln()
+                }
+            }
+        }
+    }
+}
+
+/// Result of a BOCPD update step.
+#[derive(Debug, Clone, Serialize)]
+pub struct BocpdUpdateResult {
+    /// Current step number (0-indexed).
+    pub step: usize,
+
+    /// Probability that a change point just occurred (r_t = 0).
+    pub change_point_probability: f64,
+
+    /// Maximum a posteriori run length.
+    pub map_run_length: usize,
+
+    /// Expected run length.
+    pub expected_run_length: f64,
+
+    /// Log evidence (marginal likelihood).
+    pub log_evidence: f64,
+
+    /// Full posterior over run lengths (truncated at max_run_length).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub run_length_posterior: Vec<f64>,
+}
+
+/// BOCPD change-point detector.
+pub struct BocpdDetector {
+    config: BocpdConfig,
+    /// Current step
+    step: usize,
+    /// Log run-length distribution (unnormalized)
+    log_run_length_dist: Vec<f64>,
+    /// Sufficient statistics for each run length hypothesis
+    stats: VecDeque<SufficientStats>,
+    /// Cumulative log evidence
+    cum_log_evidence: f64,
+}
+
+impl BocpdDetector {
+    /// Create a new BOCPD detector with the given configuration.
+    pub fn new(config: BocpdConfig) -> Self {
+        let stats = VecDeque::new();
+        Self {
+            config,
+            step: 0,
+            log_run_length_dist: vec![0.0], // Initial: r_0 = 0 with prob 1
+            stats,
+            cum_log_evidence: 0.0,
+        }
+    }
+
+    /// Create a detector with default configuration.
+    pub fn default_detector() -> Self {
+        Self::new(BocpdConfig::default())
+    }
+
+    /// Reset the detector to initial state.
+    pub fn reset(&mut self) {
+        self.step = 0;
+        self.log_run_length_dist = vec![0.0];
+        self.stats.clear();
+        self.cum_log_evidence = 0.0;
+    }
+
+    /// Get the current configuration.
+    pub fn config(&self) -> &BocpdConfig {
+        &self.config
+    }
+
+    /// Update with a new observation.
+    pub fn update(&mut self, observation: f64) -> BocpdUpdateResult {
+        // Guard against invalid observations
+        if !observation.is_finite() {
+            warn!(
+                "BOCPD received non-finite observation: {}, skipping update",
+                observation
+            );
+            // Return current state without update if observation is invalid
+            let posterior: Vec<f64> = self.log_run_length_dist.iter().map(|x| x.exp()).collect();
+            let change_point_probability = posterior.first().copied().unwrap_or(0.0);
+            let map_run_length = posterior
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let expected_run_length: f64 = posterior
+                .iter()
+                .enumerate()
+                .map(|(r, &p)| r as f64 * p)
+                .sum();
+
+            let res = BocpdUpdateResult {
+                step: self.step,
+                change_point_probability,
+                map_run_length,
+                expected_run_length,
+                log_evidence: self.cum_log_evidence,
+                run_length_posterior: posterior,
+            };
+            self.step += 1;
+            return res;
+        }
+
+        let h = self.config.hazard_rate;
+        let log_h = h.ln();
+        let log_1_minus_h = (1.0 - h).ln();
+
+        // Initialize stats for run length 0 if needed
+        if self.stats.is_empty() {
+            self.stats.push_back(self.new_stats());
+        }
+
+        // Compute log predictive probabilities for each run length
+        let n_runs = self.log_run_length_dist.len();
+        let mut log_pred = Vec::with_capacity(n_runs);
+        for (i, stats) in self.stats.iter().enumerate() {
+            if i < n_runs {
+                log_pred.push(stats.log_predictive(observation));
+            }
+        }
+
+        // Pad with prior predictive if needed
+        while log_pred.len() < n_runs {
+            let fresh_stats = self.new_stats();
+            log_pred.push(fresh_stats.log_predictive(observation));
+        }
+
+        // Growth probabilities: P(r_t = r_{t-1} + 1 | r_{t-1}, x_{1:t})
+        // For growth, we use the posterior predictive conditioned on the run length
+        let mut log_growth = Vec::with_capacity(n_runs);
+        for (i, &log_pred_i) in log_pred.iter().enumerate() {
+            log_growth.push(self.log_run_length_dist[i] + log_pred_i + log_1_minus_h);
+        }
+
+        // Change point probability: P(r_t = 0 | x_{1:t})
+        // For change points, we ALWAYS use the PRIOR predictive (fresh segment)
+        // This is the key difference from growth: a change means starting fresh
+        let fresh_stats = self.new_stats();
+        let log_prior_pred = fresh_stats.log_predictive(observation);
+
+        // OPTIMIZATION: Since log_run_length_dist is normalized (log-sum-exp approx 0),
+        // log_sum_exp(log_run_length_dist[i] + log_prior_pred + log_h)
+        // = log_sum_exp(log_run_length_dist) + log_prior_pred + log_h
+        // = 0 + log_prior_pred + log_h
+        let log_cp = log_prior_pred + log_h;
+
+        // New run length distribution: [r_t = 0, r_t = 1, r_t = 2, ...]
+        let mut new_log_dist = Vec::with_capacity(n_runs + 1);
+        new_log_dist.push(log_cp);
+        new_log_dist.extend(log_growth);
+
+        // Normalize
+        let log_evidence = log_sum_exp(&new_log_dist);
+
+        if log_evidence == f64::NEG_INFINITY {
+            warn!("BOCPD observation {} is impossible under current model (log_evidence = -inf). Skipping update.", observation);
+            // Return previous result but increment step? Or just return?
+            // If we skip update, we return the *current* state (before this step).
+            // But we need to return a BocpdUpdateResult for this step.
+            // Let's return the current state as if the observation didn't happen,
+            // but increment step to keep time moving?
+            // Actually, if it's impossible, maybe it's better to reset to prior (r=0)?
+            // But if even prior (log_cp) is -inf, then r=0 is also impossible.
+            // This means the emission model is completely wrong for this data point.
+            // Best to ignore this outlier point and keep distribution as is.
+
+            let posterior: Vec<f64> = self.log_run_length_dist.iter().map(|x| x.exp()).collect();
+            let change_point_probability = posterior.first().copied().unwrap_or(0.0);
+            let map_run_length = posterior
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let expected_run_length: f64 = posterior
+                .iter()
+                .enumerate()
+                .map(|(r, &p)| r as f64 * p)
+                .sum();
+
+            let res = BocpdUpdateResult {
+                step: self.step,
+                change_point_probability,
+                map_run_length,
+                expected_run_length,
+                log_evidence: self.cum_log_evidence,
+                run_length_posterior: posterior,
+            };
+            self.step += 1;
+            return res;
+        }
+
+        for x in &mut new_log_dist {
+            *x -= log_evidence;
+        }
+
+        // Truncate at max run length
+        if new_log_dist.len() > self.config.max_run_length {
+            // Renormalize after truncation
+            new_log_dist.truncate(self.config.max_run_length);
+            let log_norm = log_sum_exp(&new_log_dist);
+            for x in &mut new_log_dist {
+                *x -= log_norm;
+            }
+        }
+
+        // Update sufficient statistics
+        // First, update existing stats
+        for stats in self.stats.iter_mut() {
+            stats.update(observation);
+        }
+
+        // Add fresh stats for new run length 0
+        let mut new_stats = self.new_stats();
+        new_stats.update(observation);
+        self.stats.push_front(new_stats);
+
+        // Truncate stats to match distribution
+        while self.stats.len() > new_log_dist.len() {
+            self.stats.pop_back();
+        }
+
+        // Store new distribution
+        self.log_run_length_dist = new_log_dist;
+        self.cum_log_evidence += log_evidence;
+        self.step += 1;
+
+        // Compute summary statistics
+        let posterior: Vec<f64> = self.log_run_length_dist.iter().map(|x| x.exp()).collect();
+        let change_point_probability = posterior.first().copied().unwrap_or(0.0);
+
+        let map_run_length = posterior
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        let expected_run_length: f64 = posterior
+            .iter()
+            .enumerate()
+            .map(|(r, &p)| r as f64 * p)
+            .sum();
+
+        BocpdUpdateResult {
+            step: self.step - 1,
+            change_point_probability,
+            map_run_length,
+            expected_run_length,
+            log_evidence: self.cum_log_evidence,
+            run_length_posterior: posterior,
+        }
+    }
+
+    /// Get detected change points from a sequence of results.
+    pub fn detect_change_points(results: &[BocpdUpdateResult], threshold: f64) -> Vec<ChangePoint> {
+        let mut change_points = Vec::new();
+
+        for result in results {
+            if result.change_point_probability > threshold {
+                change_points.push(ChangePoint {
+                    step: result.step,
+                    probability: result.change_point_probability,
+                    expected_run_length: result.expected_run_length,
+                });
+            }
+        }
+
+        change_points
+    }
+
+    /// Process a batch of observations and return change points.
+    pub fn process_batch(&mut self, observations: &[f64], threshold: f64) -> BatchResult {
+        let mut results = Vec::with_capacity(observations.len());
+
+        for &obs in observations {
+            results.push(self.update(obs));
+        }
+
+        let change_points = Self::detect_change_points(&results, threshold);
+
+        BatchResult {
+            results,
+            change_points,
+        }
+    }
+
+    fn new_stats(&self) -> SufficientStats {
+        match &self.config.emission_model {
+            EmissionModel::NormalGamma {
+                mu0,
+                kappa0,
+                alpha0,
+                beta0,
+            } => SufficientStats::new_normal_gamma(*mu0, *kappa0, *alpha0, *beta0),
+            EmissionModel::PoissonGamma { alpha, beta } => {
+                SufficientStats::new_poisson_gamma(*alpha, *beta)
+            }
+            EmissionModel::BetaBernoulli { alpha, beta } => {
+                SufficientStats::new_beta_bernoulli(*alpha, *beta)
+            }
+        }
+    }
+}
+
+/// A detected change point.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChangePoint {
+    /// Step where change was detected.
+    pub step: usize,
+    /// Probability of change point.
+    pub probability: f64,
+    /// Expected run length at this point.
+    pub expected_run_length: f64,
+}
+
+/// Result of batch processing.
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchResult {
+    /// Results for each observation.
+    pub results: Vec<BocpdUpdateResult>,
+    /// Detected change points above threshold.
+    pub change_points: Vec<ChangePoint>,
+}
+
+/// Evidence for the decision core from BOCPD.
+#[derive(Debug, Clone, Serialize)]
+pub struct BocpdEvidence {
+    /// Whether a recent change point was detected.
+    pub recent_change: bool,
+    /// Most recent change point probability.
+    pub change_probability: f64,
+    /// Current regime length (MAP run length).
+    pub regime_length: usize,
+    /// Number of change points in observation window.
+    pub change_count: usize,
+    /// Confidence in regime stability.
+    pub regime_confidence: f64,
+}
+
+impl BocpdEvidence {
+    /// Create evidence from batch results.
+    pub fn from_batch(batch: &BatchResult, window_size: usize) -> Self {
+        let recent_results: Vec<_> = batch.results.iter().rev().take(window_size).collect();
+
+        let recent_change = recent_results
+            .first()
+            .map(|r| r.change_point_probability > 0.5)
+            .unwrap_or(false);
+
+        let change_probability = recent_results
+            .first()
+            .map(|r| r.change_point_probability)
+            .unwrap_or(0.0);
+
+        let regime_length = recent_results
+            .first()
+            .map(|r| r.map_run_length)
+            .unwrap_or(0);
+
+        let change_count = recent_results
+            .iter()
+            .filter(|r| r.change_point_probability > 0.5)
+            .count();
+
+        // Regime confidence: inverse of change probability, scaled
+        let regime_confidence = 1.0 - change_probability.min(1.0);
+
+        BocpdEvidence {
+            recent_change,
+            change_probability,
+            regime_length,
+            change_count,
+            regime_confidence,
+        }
+    }
+}
+
+// Helper functions
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
+        if a.is_nan() || b.is_nan() {
+            return false;
+        }
+        (a - b).abs() <= tol
+    }
+
+    #[test]
+    fn test_config_validation() {
+        let valid = BocpdConfig::default();
+        assert!(valid.validate().is_ok());
+
+        let invalid_hazard = BocpdConfig {
+            hazard_rate: 0.0,
+            ..Default::default()
+        };
+        assert!(invalid_hazard.validate().is_err());
+
+        let invalid_hazard2 = BocpdConfig {
+            hazard_rate: 1.0,
+            ..Default::default()
+        };
+        assert!(invalid_hazard2.validate().is_err());
+
+        let invalid_max_run = BocpdConfig {
+            max_run_length: 0,
+            ..Default::default()
+        };
+        assert!(invalid_max_run.validate().is_err());
+    }
+
+    #[test]
+    fn test_poisson_gamma_stable_regime() {
+        let config = BocpdConfig {
+            hazard_rate: 0.01,
+            max_run_length: 50,
+            emission_model: EmissionModel::PoissonGamma {
+                alpha: 1.0,
+                beta: 1.0,
+            },
+        };
+
+        let mut detector = BocpdDetector::new(config);
+
+        // Stable regime with rate ~5
+        let observations = vec![5.0, 6.0, 4.0, 5.0, 5.0, 6.0, 4.0, 5.0, 5.0, 5.0];
+
+        for obs in observations {
+            let result = detector.update(obs);
+            // Stable regime should have low change probability after initial burn-in
+            assert!(result.change_point_probability <= 1.0);
+            assert!(result.map_run_length <= 50);
+        }
+    }
+
+    #[test]
+    fn test_poisson_gamma_detects_change() {
+        let config = BocpdConfig {
+            hazard_rate: 0.1, // Higher hazard for faster detection
+            max_run_length: 50,
+            emission_model: EmissionModel::PoissonGamma {
+                alpha: 1.0,
+                beta: 0.2, // Prior mean = 5
+            },
+        };
+
+        let mut detector = BocpdDetector::new(config);
+
+        // Regime 1: rate ~5
+        let regime1 = vec![5.0, 5.0, 5.0, 5.0, 5.0];
+        // Regime 2: rate ~20 (large jump)
+        let regime2 = vec![20.0, 20.0, 20.0, 20.0, 20.0];
+
+        for obs in regime1 {
+            detector.update(obs);
+        }
+
+        let mut max_cp_prob: f64 = 0.0;
+        for obs in regime2 {
+            let result = detector.update(obs);
+            max_cp_prob = max_cp_prob.max(result.change_point_probability);
+        }
+
+        // Should detect the change with high probability
+        assert!(
+            max_cp_prob > 0.3,
+            "Should detect change point, max_cp_prob = {}",
+            max_cp_prob
+        );
+    }
+
+    #[test]
+    fn test_beta_bernoulli() {
+        let config = BocpdConfig {
+            hazard_rate: 0.1,
+            max_run_length: 50,
+            emission_model: EmissionModel::BetaBernoulli {
+                alpha: 1.0,
+                beta: 1.0,
+            },
+        };
+
+        let mut detector = BocpdDetector::new(config);
+
+        // Mostly 1s
+        let regime1 = vec![1.0, 1.0, 1.0, 1.0, 1.0];
+        // Mostly 0s (change)
+        let regime2 = vec![0.0, 0.0, 0.0, 0.0, 0.0];
+
+        for obs in regime1 {
+            detector.update(obs);
+        }
+
+        let mut max_cp_prob: f64 = 0.0;
+        for obs in regime2 {
+            let result = detector.update(obs);
+            max_cp_prob = max_cp_prob.max(result.change_point_probability);
+        }
+
+        // Should detect change in binary regime
+        assert!(
+            max_cp_prob > 0.2,
+            "Should detect binary regime change, max_cp_prob = {}",
+            max_cp_prob
+        );
+    }
+
+    #[test]
+    fn test_batch_processing() {
+        let config = BocpdConfig {
+            hazard_rate: 0.1,
+            max_run_length: 50,
+            emission_model: EmissionModel::PoissonGamma {
+                alpha: 1.0,
+                beta: 0.2,
+            },
+        };
+
+        let mut detector = BocpdDetector::new(config);
+
+        let observations = vec![
+            5.0, 5.0, 5.0, 5.0, 5.0, // Regime 1
+            20.0, 20.0, 20.0, 20.0, 20.0, // Regime 2
+        ];
+
+        let batch = detector.process_batch(&observations, 0.3);
+
+        assert_eq!(batch.results.len(), 10);
+        // May or may not detect change point depending on threshold
+        assert!(batch.change_points.len() <= 10);
+    }
+
+    #[test]
+    fn test_bocpd_evidence() {
+        let config = BocpdConfig::default();
+        let mut detector = BocpdDetector::new(config);
+
+        let observations = vec![5.0; 10];
+        let batch = detector.process_batch(&observations, 0.5);
+
+        let evidence = BocpdEvidence::from_batch(&batch, 5);
+
+        assert!(evidence.regime_confidence >= 0.0);
+        assert!(evidence.regime_confidence <= 1.0);
+        assert!(evidence.regime_length <= 10);
+    }
+
+    #[test]
+    fn test_log_sum_exp() {
+        let xs = vec![0.0, 0.0];
+        let result = log_sum_exp(&xs);
+        assert!(approx_eq(result, 2.0_f64.ln(), 1e-10));
+
+        let xs2 = vec![-1000.0, -1000.0, -1000.0];
+        let result2 = log_sum_exp(&xs2);
+        assert!(approx_eq(result2, -1000.0 + 3.0_f64.ln(), 1e-10));
+    }
+
+    #[test]
+    fn test_log_gamma() {
+        // Known values
+        assert!(approx_eq(log_gamma(1.0), 0.0, 1e-6));
+        assert!(approx_eq(log_gamma(2.0), 0.0, 1e-6)); // 1! = 1
+        assert!(approx_eq(log_gamma(3.0), 2.0_f64.ln(), 1e-6)); // 2! = 2
+        assert!(approx_eq(log_gamma(4.0), 6.0_f64.ln(), 1e-6)); // 3! = 6
+    }
+
+    #[test]
+    fn test_reset() {
+        let config = BocpdConfig::default();
+        let mut detector = BocpdDetector::new(config);
+
+        detector.update(5.0);
+        detector.update(5.0);
+        assert_eq!(detector.step, 2);
+
+        detector.reset();
+        assert_eq!(detector.step, 0);
+        assert_eq!(detector.log_run_length_dist.len(), 1);
+    }
+
+    #[test]
+    fn test_normal_gamma_model() {
+        let config = BocpdConfig {
+            hazard_rate: 0.1,
+            max_run_length: 50,
+            emission_model: EmissionModel::NormalGamma {
+                mu0: 0.0,
+                kappa0: 1.0,
+                alpha0: 1.0,
+                beta0: 1.0,
+            },
+        };
+
+        let mut detector = BocpdDetector::new(config);
+
+        // Stable regime around 0
+        for _ in 0..5 {
+            detector.update(0.1);
+        }
+
+        // Jump to regime around 10
+        let mut detected_change = false;
+        for _ in 0..5 {
+            let result = detector.update(10.0);
+            if result.change_point_probability > 0.3 {
+                detected_change = true;
+            }
+        }
+
+        assert!(detected_change, "Should detect mean shift");
+    }
+
+    // ── EmissionModel ──────────────────────────────────────────────
+
+    #[test]
+    fn emission_model_default_is_poisson_gamma() {
+        let em = EmissionModel::default();
+        assert!(
+            matches!(em, EmissionModel::PoissonGamma { alpha, beta } if approx_eq(alpha, 1.0, 1e-12) && approx_eq(beta, 1.0, 1e-12))
+        );
+    }
+
+    #[test]
+    fn emission_model_serde_poisson_gamma() {
+        let em = EmissionModel::PoissonGamma {
+            alpha: 2.0,
+            beta: 3.0,
+        };
+        let json = serde_json::to_string(&em).unwrap();
+        let back: EmissionModel = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(back, EmissionModel::PoissonGamma { alpha, beta } if approx_eq(alpha, 2.0, 1e-12) && approx_eq(beta, 3.0, 1e-12))
+        );
+    }
+
+    #[test]
+    fn emission_model_serde_normal_gamma() {
+        let em = EmissionModel::NormalGamma {
+            mu0: 1.0,
+            kappa0: 2.0,
+            alpha0: 3.0,
+            beta0: 4.0,
+        };
+        let json = serde_json::to_string(&em).unwrap();
+        let back: EmissionModel = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(back, EmissionModel::NormalGamma { mu0, kappa0, alpha0, beta0 }
+            if approx_eq(mu0, 1.0, 1e-12) && approx_eq(kappa0, 2.0, 1e-12)
+            && approx_eq(alpha0, 3.0, 1e-12) && approx_eq(beta0, 4.0, 1e-12))
+        );
+    }
+
+    #[test]
+    fn emission_model_serde_beta_bernoulli() {
+        let em = EmissionModel::BetaBernoulli {
+            alpha: 1.5,
+            beta: 2.5,
+        };
+        let json = serde_json::to_string(&em).unwrap();
+        let back: EmissionModel = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, EmissionModel::BetaBernoulli { alpha, beta }
+            if approx_eq(alpha, 1.5, 1e-12) && approx_eq(beta, 2.5, 1e-12)));
+    }
+
+    // ── BocpdConfig ────────────────────────────────────────────────
+
+    #[test]
+    fn config_default_values() {
+        let cfg = BocpdConfig::default();
+        assert!(approx_eq(cfg.hazard_rate, 0.01, 1e-12));
+        assert_eq!(cfg.max_run_length, 1000);
+    }
+
+    #[test]
+    fn config_serde_roundtrip() {
+        let cfg = BocpdConfig {
+            hazard_rate: 0.05,
+            max_run_length: 200,
+            emission_model: EmissionModel::BetaBernoulli {
+                alpha: 2.0,
+                beta: 2.0,
+            },
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: BocpdConfig = serde_json::from_str(&json).unwrap();
+        assert!(approx_eq(back.hazard_rate, 0.05, 1e-12));
+        assert_eq!(back.max_run_length, 200);
+    }
+
+    #[test]
+    fn config_validate_negative_hazard() {
+        let cfg = BocpdConfig {
+            hazard_rate: -0.1,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn config_validate_hazard_one() {
+        let cfg = BocpdConfig {
+            hazard_rate: 1.0,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn config_validate_poisson_negative_alpha() {
+        let cfg = BocpdConfig {
+            emission_model: EmissionModel::PoissonGamma {
+                alpha: -1.0,
+                beta: 1.0,
+            },
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn config_validate_poisson_zero_beta() {
+        let cfg = BocpdConfig {
+            emission_model: EmissionModel::PoissonGamma {
+                alpha: 1.0,
+                beta: 0.0,
+            },
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn config_validate_normal_gamma_zero_kappa() {
+        let cfg = BocpdConfig {
+            emission_model: EmissionModel::NormalGamma {
+                mu0: 0.0,
+                kappa0: 0.0,
+                alpha0: 1.0,
+                beta0: 1.0,
+            },
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn config_validate_beta_bernoulli_negative() {
+        let cfg = BocpdConfig {
+            emission_model: EmissionModel::BetaBernoulli {
+                alpha: -1.0,
+                beta: 1.0,
+            },
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    // ── BocpdError ─────────────────────────────────────────────────
+
+    #[test]
+    fn error_display_hazard() {
+        let err = BocpdError::InvalidHazardRate(0.0);
+        assert!(err.to_string().contains("hazard rate"));
+    }
+
+    #[test]
+    fn error_display_max_run() {
+        let err = BocpdError::InvalidMaxRunLength(0);
+        assert!(err.to_string().contains("max run length"));
+    }
+
+    #[test]
+    fn error_display_emission() {
+        let err = BocpdError::InvalidEmissionParameter {
+            message: "test".to_string(),
+        };
+        assert!(err.to_string().contains("emission model"));
+    }
+
+    #[test]
+    fn error_display_observation() {
+        let err = BocpdError::InvalidObservation(f64::NAN);
+        assert!(err.to_string().contains("observation"));
+    }
+
+    // ── BocpdDetector ──────────────────────────────────────────────
+
+    #[test]
+    fn default_detector() {
+        let detector = BocpdDetector::default_detector();
+        assert!(approx_eq(detector.config().hazard_rate, 0.01, 1e-12));
+    }
+
+    #[test]
+    fn update_non_finite_returns_current_state() {
+        let mut detector = BocpdDetector::default_detector();
+        detector.update(5.0);
+        let result = detector.update(f64::NAN);
+        // Step should not advance for NaN
+        assert_eq!(result.step, 1); // Still at step after first update
+    }
+
+    #[test]
+    fn update_step_increments() {
+        let mut detector = BocpdDetector::default_detector();
+        let r0 = detector.update(5.0);
+        assert_eq!(r0.step, 0);
+        let r1 = detector.update(5.0);
+        assert_eq!(r1.step, 1);
+        let r2 = detector.update(5.0);
+        assert_eq!(r2.step, 2);
+    }
+
+    #[test]
+    fn update_result_probabilities_valid() {
+        let mut detector = BocpdDetector::default_detector();
+        for i in 0..5 {
+            let result = detector.update(5.0);
+            assert!(result.change_point_probability >= 0.0);
+            assert!(result.change_point_probability <= 1.0);
+            assert!(result.expected_run_length >= 0.0);
+            assert_eq!(result.step, i);
+        }
+    }
+
+    #[test]
+    fn update_result_serializes() {
+        let mut detector = BocpdDetector::default_detector();
+        let result = detector.update(5.0);
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"step\""));
+        assert!(json.contains("\"change_point_probability\""));
+    }
+
+    #[test]
+    fn detect_change_points_below_threshold() {
+        let results = vec![BocpdUpdateResult {
+            step: 0,
+            change_point_probability: 0.1,
+            map_run_length: 0,
+            expected_run_length: 0.0,
+            log_evidence: 0.0,
+            run_length_posterior: vec![],
+        }];
+        let cps = BocpdDetector::detect_change_points(&results, 0.5);
+        assert!(cps.is_empty());
+    }
+
+    #[test]
+    fn detect_change_points_above_threshold() {
+        let results = vec![BocpdUpdateResult {
+            step: 5,
+            change_point_probability: 0.8,
+            map_run_length: 0,
+            expected_run_length: 0.5,
+            log_evidence: -1.0,
+            run_length_posterior: vec![],
+        }];
+        let cps = BocpdDetector::detect_change_points(&results, 0.5);
+        assert_eq!(cps.len(), 1);
+        assert_eq!(cps[0].step, 5);
+    }
+
+    // ── BocpdEvidence ──────────────────────────────────────────────
+
+    #[test]
+    fn evidence_from_empty_batch() {
+        let batch = BatchResult {
+            results: vec![],
+            change_points: vec![],
+        };
+        let evidence = BocpdEvidence::from_batch(&batch, 5);
+        assert!(!evidence.recent_change);
+        assert!(approx_eq(evidence.change_probability, 0.0, 1e-12));
+        assert_eq!(evidence.regime_length, 0);
+        assert_eq!(evidence.change_count, 0);
+    }
+
+    #[test]
+    fn evidence_regime_confidence_bounded() {
+        let mut detector = BocpdDetector::default_detector();
+        let observations = vec![5.0; 20];
+        let batch = detector.process_batch(&observations, 0.5);
+        let evidence = BocpdEvidence::from_batch(&batch, 10);
+        assert!(evidence.regime_confidence >= 0.0);
+        assert!(evidence.regime_confidence <= 1.0);
+    }
+
+    #[test]
+    fn change_point_serializes() {
+        let cp = ChangePoint {
+            step: 10,
+            probability: 0.9,
+            expected_run_length: 1.5,
+        };
+        let json = serde_json::to_string(&cp).unwrap();
+        assert!(json.contains("\"step\":10"));
+    }
+
+    // ── log_sum_exp edge cases ─────────────────────────────────────
+
+    #[test]
+    fn log_sum_exp_empty() {
+        assert_eq!(log_sum_exp(&[]), f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn log_sum_exp_single() {
+        assert!(approx_eq(log_sum_exp(&[5.0]), 5.0, 1e-10));
+    }
+
+    #[test]
+    fn log_sum_exp_all_neg_inf() {
+        assert_eq!(
+            log_sum_exp(&[f64::NEG_INFINITY, f64::NEG_INFINITY]),
+            f64::NEG_INFINITY
+        );
+    }
+
+    // ── log_gamma edge cases ────────────────────────────────────────
+
+    #[test]
+    fn log_gamma_negative_is_nan() {
+        assert!(log_gamma(-1.0).is_nan());
+    }
+
+    #[test]
+    fn log_gamma_zero_is_nan() {
+        assert!(log_gamma(0.0).is_nan());
+    }
+
+    #[test]
+    fn log_gamma_half() {
+        // Gamma(0.5) = sqrt(pi) ≈ 1.7724538509
+        let expected = std::f64::consts::PI.sqrt().ln();
+        assert!(approx_eq(log_gamma(0.5), expected, 1e-4));
+    }
+
+    #[test]
+    fn log_gamma_five() {
+        // Gamma(5) = 4! = 24
+        assert!(approx_eq(log_gamma(5.0), 24.0_f64.ln(), 1e-6));
+    }
+}

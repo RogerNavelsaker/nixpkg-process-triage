@@ -1,0 +1,21 @@
+{
+  "stubbed": false,
+  "source": {
+    "path": "upstream",
+    "version": "2.0.5",
+    "rev": "be277c09d7ea7e3f59f1924d549b52a81c400264"
+  },
+  "package": {
+    "version": "2.0.5"
+  },
+  "binary": {
+    "name": "pt",
+    "upstreamName": "pt-core",
+    "package": "pt-core"
+  },
+  "meta": {
+    "description": "Process triage inference and decision engine",
+    "homepage": "https://github.com/Dicklesworthstone/process_triage",
+    "licenseSpdx": "MIT"
+  }
+}

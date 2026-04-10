@@ -1,0 +1,426 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://process-triage.dev/schemas/capabilities-manifest/1.0.0",
+  "title": "Capabilities Manifest",
+  "description": "Schema for the capabilities manifest passed from pt (bash) to pt-core (Rust)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "os", "tools", "user", "paths", "discovered_at"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "description": "Schema version for forward compatibility",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "examples": ["1.0.0"]
+    },
+    "os": {
+      "type": "object",
+      "description": "Operating system information",
+      "required": ["family"],
+      "additionalProperties": false,
+      "properties": {
+        "family": {
+          "type": "string",
+          "enum": ["linux", "macos", "freebsd", "unknown"],
+          "description": "OS family (affects collection strategy)"
+        },
+        "name": {
+          "type": "string",
+          "description": "Distribution or OS name",
+          "examples": ["Ubuntu", "Fedora", "Arch", "macOS"]
+        },
+        "release": {
+          "type": "string",
+          "description": "OS release name (e.g., 'Ubuntu 24.04', 'macOS 14.0')"
+        },
+        "version": {
+          "type": "string",
+          "description": "OS version string",
+          "examples": ["24.04", "40", "Sonoma 14.5"]
+        },
+        "kernel": {
+          "type": "string",
+          "description": "Kernel version",
+          "examples": ["6.8.0-40-generic", "23.5.0"]
+        },
+        "arch": {
+          "type": "string",
+          "enum": ["x86_64", "aarch64", "arm64", "i686", "armv7l"],
+          "description": "CPU architecture"
+        }
+      }
+    },
+    "tools": {
+      "type": "object",
+      "description": "Available diagnostic tools and their capabilities",
+      "additionalProperties": {
+        "$ref": "#/$defs/tool_info"
+      }
+    },
+    "proc_fs": {
+      "type": "object",
+      "description": "Linux /proc filesystem availability",
+      "additionalProperties": false,
+      "properties": {
+        "available": {
+          "type": "boolean",
+          "description": "Whether /proc is mounted and readable"
+        },
+        "readable_fields": {
+          "type": "array",
+          "description": "Which /proc/PID/* files are readable by current user",
+          "items": {
+            "type": "string",
+            "enum": ["stat", "status", "io", "cgroup", "wchan", "fd", "maps", "smaps", "schedstat", "sched", "ns", "environ", "cmdline", "cwd", "exe"]
+          }
+        }
+      }
+    },
+    "cgroups": {
+      "type": "object",
+      "description": "Control groups availability",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "type": "string",
+          "enum": ["v1", "v2", "hybrid", "none"],
+          "description": "Cgroups version in use"
+        },
+        "readable": {
+          "type": "boolean",
+          "description": "Whether cgroup paths are readable"
+        },
+        "controllers": {
+          "type": "array",
+          "description": "Available cgroup controllers",
+          "items": {
+            "type": "string",
+            "enum": ["cpu", "cpuset", "memory", "io", "pids", "rdma", "hugetlb", "cpuacct", "devices", "freezer", "net_cls", "net_prio", "blkio"]
+          }
+        }
+      }
+    },
+    "systemd": {
+      "type": "object",
+      "description": "Systemd availability (Linux)",
+      "additionalProperties": false,
+      "properties": {
+        "available": {
+          "type": "boolean",
+          "description": "Whether systemd is the init system"
+        },
+        "version": {
+          "type": "string",
+          "description": "Systemd version",
+          "examples": ["256"]
+        },
+        "user_units": {
+          "type": "boolean",
+          "description": "Whether user units are accessible"
+        }
+      }
+    },
+    "launchd": {
+      "type": "object",
+      "description": "Launchd availability (macOS)",
+      "additionalProperties": false,
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "user_agents": {
+          "type": "boolean",
+          "description": "Whether user agents are accessible"
+        }
+      }
+    },
+    "psi": {
+      "type": "object",
+      "description": "Pressure Stall Information availability (Linux)",
+      "additionalProperties": false,
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "cpu": { "type": "boolean" },
+        "memory": { "type": "boolean" },
+        "io": { "type": "boolean" }
+      }
+    },
+    "containers": {
+      "type": "object",
+      "description": "Container runtime detection",
+      "additionalProperties": false,
+      "properties": {
+        "docker": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "available": { "type": "boolean" },
+            "socket": { "type": "string" },
+            "version": { "type": "string" }
+          }
+        },
+        "podman": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "available": { "type": "boolean" },
+            "rootless": { "type": "boolean" },
+            "version": { "type": "string" }
+          }
+        },
+        "inside_container": {
+          "type": "boolean",
+          "description": "Whether running inside a container"
+        },
+        "container_type": {
+          "type": ["string", "null"],
+          "description": "Container type if running inside one"
+        }
+      }
+    },
+    "sudo": {
+      "type": "object",
+      "description": "Sudo availability for privileged operations",
+      "additionalProperties": false,
+      "properties": {
+        "available": {
+          "type": "boolean",
+          "description": "Whether sudo is available"
+        },
+        "passwordless": {
+          "type": "boolean",
+          "description": "Whether sudo can run without password (NOPASSWD)"
+        },
+        "timeout_active": {
+          "type": "boolean",
+          "description": "Whether a cached sudo session exists"
+        }
+      }
+    },
+    "user": {
+      "type": "object",
+      "description": "Current user information",
+      "additionalProperties": false,
+      "required": ["uid", "username", "home"],
+      "properties": {
+        "uid": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "User ID"
+        },
+        "username": {
+          "type": "string",
+          "description": "Username"
+        },
+        "home": {
+          "type": "string",
+          "description": "Home directory path"
+        },
+        "shell": {
+          "type": "string",
+          "description": "User's login shell path"
+        }
+      }
+    },
+    "paths": {
+      "type": "object",
+      "description": "Standard paths used by process_triage",
+      "additionalProperties": false,
+      "required": ["config_dir", "data_dir"],
+      "properties": {
+        "config_dir": {
+          "type": "string",
+          "description": "Configuration directory (e.g., ~/.config/process_triage)"
+        },
+        "data_dir": {
+          "type": "string",
+          "description": "Data directory (e.g., ~/.local/share/process_triage)"
+        },
+        "cache_dir": {
+          "type": "string",
+          "description": "Cache directory (e.g., ~/.cache/process_triage)"
+        },
+        "telemetry_dir": {
+          "type": "string",
+          "description": "Telemetry storage directory"
+        },
+        "lock_file": {
+          "type": "string",
+          "description": "Path to the coordination lock file"
+        }
+      }
+    },
+    "system": {
+      "type": "object",
+      "description": "System resource information",
+      "additionalProperties": false,
+      "properties": {
+        "hostname": { "type": "string" },
+        "cpu_cores": { "type": "integer", "minimum": 1 },
+        "total_memory_mb": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "privileges": {
+      "type": "object",
+      "description": "Privilege and capability information",
+      "additionalProperties": false,
+      "properties": {
+        "is_root": {
+          "type": "boolean",
+          "description": "Whether the current user is root"
+        },
+        "effective_uid": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Effective UID"
+        },
+        "can_sudo": {
+          "type": "boolean",
+          "description": "Whether non-interactive sudo is available"
+        },
+        "perf_paranoid": {
+          "type": "integer",
+          "minimum": -1,
+          "maximum": 4,
+          "description": "Value of /proc/sys/kernel/perf_event_paranoid (-1 to 4)"
+        },
+        "ptrace_scope": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3,
+          "description": "Value of /proc/sys/kernel/yama/ptrace_scope (0-3)"
+        },
+        "linux_capabilities": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Effective Linux capabilities"
+        }
+      }
+    },
+    "discovered_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of when capabilities were discovered"
+    },
+    "discovery_duration_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How long capability discovery took in milliseconds"
+    },
+    "wrapper_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "description": "Version of pt (bash) that generated this manifest"
+    }
+  },
+  "$defs": {
+    "tool_info": {
+      "type": "object",
+      "description": "Information about a single diagnostic tool",
+      "required": ["available"],
+      "additionalProperties": false,
+      "properties": {
+        "available": {
+          "type": "boolean",
+          "description": "Whether the tool is installed and executable"
+        },
+        "path": {
+          "type": "string",
+          "description": "Absolute path to the tool binary",
+          "examples": ["/usr/bin/perf", "/usr/sbin/ss"]
+        },
+        "version": {
+          "type": "string",
+          "description": "Tool version string",
+          "examples": ["6.8.12", "iproute2-6.1.0"]
+        },
+        "permissions": {
+          "type": "object",
+          "description": "Permission-related capabilities for this tool",
+          "additionalProperties": false,
+          "properties": {
+            "sudo": {
+              "type": "boolean",
+              "description": "Tool requires sudo for full functionality"
+            },
+            "cap_sys_ptrace": {
+              "type": "boolean",
+              "description": "CAP_SYS_PTRACE capability available"
+            },
+            "cap_perfmon": {
+              "type": "boolean",
+              "description": "CAP_PERFMON capability available"
+            },
+            "cap_bpf": {
+              "type": "boolean",
+              "description": "CAP_BPF capability available"
+            },
+            "cap_net_admin": {
+              "type": "boolean",
+              "description": "CAP_NET_ADMIN capability available"
+            },
+            "suid": {
+              "type": "boolean",
+              "description": "Tool has setuid bit"
+            }
+          }
+        },
+        "functional": {
+          "type": "boolean",
+          "description": "Tool passed a basic functionality check (not just installed)"
+        },
+        "restricted_reason": {
+          "type": "string",
+          "description": "Why the tool has limited functionality",
+          "examples": ["kernel.perf_event_paranoid=4", "unprivileged_bpf_disabled=1"]
+        },
+        "notes": {
+          "type": "string",
+          "description": "Additional notes about tool availability or quirks"
+        },
+        "reason": {
+          "type": "string",
+          "description": "Reason tool is unavailable (if not available)"
+        }
+      },
+      "if": {
+        "properties": { "available": { "const": true } }
+      },
+      "then": {
+        "required": ["path"]
+      }
+    }
+  },
+  "examples": [
+    {
+      "schema_version": "1.0.0",
+      "os": {
+        "family": "linux",
+        "name": "Ubuntu",
+        "release": "Ubuntu 24.04",
+        "version": "24.04",
+        "kernel": "6.8.0-40-generic",
+        "arch": "x86_64"
+      },
+      "user": {
+        "uid": 1000,
+        "username": "user",
+        "home": "/home/USER",
+        "shell": "/bin/bash"
+      },
+      "paths": {
+        "config_dir": "/home/USER/.config/process_triage",
+        "data_dir": "/home/USER/.local/share/process_triage"
+      },
+      "tools": {
+        "ps": {
+          "available": true,
+          "path": "/usr/bin/ps"
+        }
+      },
+      "discovered_at": "2026-02-05T01:33:00Z"
+    }
+  ]
+}

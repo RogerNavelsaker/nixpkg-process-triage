@@ -1,0 +1,330 @@
+#!/usr/bin/env bats
+
+PT_SCRIPT="${BATS_TEST_DIRNAME}/../pt"
+
+setup() {
+    if [[ ! -x "$PT_SCRIPT" ]]; then
+        echo "pt wrapper not found at $PT_SCRIPT" >&2
+        exit 1
+    fi
+
+    export TEST_DIR="${BATS_TEST_TMPDIR}/pt_wrapper_mode_${BATS_TEST_NUMBER}_$$"
+    mkdir -p "$TEST_DIR"
+
+    export MOCK_LOG="${TEST_DIR}/mock.log"
+    export MOCK_BIN_DIR="${TEST_DIR}/mock-bin"
+    mkdir -p "$MOCK_BIN_DIR"
+    export MOCK_PT_CORE="${TEST_DIR}/pt-core-mock"
+    export PT_WRAPPER_VERSION
+    PT_WRAPPER_VERSION="$(sed -n 's/^readonly VERSION="\([^"]*\)".*/\1/p' "$PT_SCRIPT" | head -n1)"
+    if [[ -z "$PT_WRAPPER_VERSION" ]]; then
+        echo "failed to parse wrapper version from $PT_SCRIPT" >&2
+        exit 1
+    fi
+    cat > "$MOCK_PT_CORE" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${PT_WRAPPER_TEST_LOG:?PT_WRAPPER_TEST_LOG must be set}"
+
+{
+    printf 'PT_UI_MODE=%s\n' "${PT_UI_MODE:-}"
+    printf 'ARGS=%s\n' "$*"
+} > "$PT_WRAPPER_TEST_LOG"
+EOF
+    chmod +x "$MOCK_PT_CORE"
+}
+
+@test "wrapper: --shell sets mode and strips wrapper flag before forwarding" {
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        "$PT_SCRIPT" --shell scan --format json
+
+    [ "$status" -eq 0 ]
+    grep -q '^PT_UI_MODE=shell$' "$MOCK_LOG"
+    grep -q '^ARGS=scan --format json$' "$MOCK_LOG"
+}
+
+@test "wrapper: --tui sets mode and strips wrapper flag before forwarding" {
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        "$PT_SCRIPT" --tui run
+
+    [ "$status" -eq 0 ]
+    grep -q '^PT_UI_MODE=tui$' "$MOCK_LOG"
+    grep -q '^ARGS=run$' "$MOCK_LOG"
+}
+
+@test "wrapper: --shell and --tui together fail fast" {
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        "$PT_SCRIPT" --shell --tui scan
+
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"--shell and --tui cannot be used together"* ]]
+    [ ! -f "$MOCK_LOG" ]
+}
+
+@test "wrapper: PT_UI_MODE=tui forces tui mode" {
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        PT_UI_MODE=tui \
+        "$PT_SCRIPT" scan
+
+    [ "$status" -eq 0 ]
+    grep -q '^PT_UI_MODE=tui$' "$MOCK_LOG"
+}
+
+@test "wrapper: auto mode picks shell in CI/non-interactive contexts" {
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        PT_UI_MODE=auto \
+        CI=true \
+        "$PT_SCRIPT" scan
+
+    [ "$status" -eq 0 ]
+    grep -q '^PT_UI_MODE=shell$' "$MOCK_LOG"
+}
+
+@test "wrapper: invalid PT_UI_MODE falls back to auto detection" {
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        PT_UI_MODE=invalid_mode \
+        TERM=dumb \
+        "$PT_SCRIPT" scan
+
+    [ "$status" -eq 0 ]
+    grep -q '^PT_UI_MODE=shell$' "$MOCK_LOG"
+}
+
+@test "wrapper: deep alias rewrites to deep-scan before forwarding" {
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        "$PT_SCRIPT" deep --format json
+
+    [ "$status" -eq 0 ]
+    grep -q '^ARGS=deep-scan --format json$' "$MOCK_LOG"
+}
+
+@test "wrapper: scan deep rewrites to deep-scan before forwarding" {
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        "$PT_SCRIPT" scan deep --format json
+
+    [ "$status" -eq 0 ]
+    grep -q '^ARGS=deep-scan --format json$' "$MOCK_LOG"
+}
+
+@test "wrapper: history reads decision memory without forwarding to pt-core" {
+    local config_dir="${TEST_DIR}/config"
+    mkdir -p "$config_dir"
+    cat > "${config_dir}/decisions.json" << 'EOF'
+{"bun test --watch":"kill","vim":"spare"}
+EOF
+
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        PROCESS_TRIAGE_CONFIG="$config_dir" \
+        "$PT_SCRIPT" history
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Decision history (2 total)"* ]]
+    [[ "$output" == *"kill: 1"* ]]
+    [[ "$output" == *$'kill\tbun test --watch'* ]]
+    [ ! -f "$MOCK_LOG" ]
+}
+
+@test "wrapper: clear empties decision memory without forwarding to pt-core" {
+    local config_dir="${TEST_DIR}/config"
+    mkdir -p "$config_dir"
+    cat > "${config_dir}/decisions.json" << 'EOF'
+{"pattern1":"kill","pattern2":"spare"}
+EOF
+
+    run bash -lc "printf 'y\n' | env PT_CORE_PATH='$MOCK_PT_CORE' PT_WRAPPER_TEST_LOG='$MOCK_LOG' PROCESS_TRIAGE_CONFIG='$config_dir' '$PT_SCRIPT' clear"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Cleared 2 decisions."* ]]
+    grep -q '^{}$' "${config_dir}/decisions.json"
+    [ ! -f "$MOCK_LOG" ]
+}
+
+@test "wrapper: top-level help shows wrapper-only commands and flags" {
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        "$PT_SCRIPT" help
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Process Triage wrapper for pt-core"* ]]
+    [[ "$output" == *"history"* ]]
+    [[ "$output" == *"clear"* ]]
+    [[ "$output" == *"--shell"* ]]
+    [[ "$output" == *"--tui"* ]]
+    [[ "$output" == *"pt help <subcommand>"* ]]
+    [ ! -f "$MOCK_LOG" ]
+}
+
+@test "wrapper: --help uses wrapper-aware top-level help" {
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        "$PT_SCRIPT" --help
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Process Triage wrapper for pt-core"* ]]
+    [ ! -f "$MOCK_LOG" ]
+}
+
+@test "wrapper: help with subcommand still forwards to pt-core" {
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        "$PT_SCRIPT" help query
+
+    [ "$status" -eq 0 ]
+    grep -q '^ARGS=help query$' "$MOCK_LOG"
+}
+
+@test "wrapper: version check still works with wrapper mode flags" {
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        "$PT_SCRIPT" --shell --version
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"pt ${PT_WRAPPER_VERSION}"* ]]
+    [ ! -f "$MOCK_LOG" ]
+}
+
+@test "wrapper: update enforces VERIFY=1 for installer invocation" {
+    cat > "${MOCK_BIN_DIR}/curl" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Return an installer script to stdout. The script fails unless VERIFY=1.
+cat <<'INSTALLER'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${VERIFY:-}" != "1" ]]; then
+  echo "VERIFY missing" >&2
+  exit 44
+fi
+exit 0
+INSTALLER
+EOF
+    chmod +x "${MOCK_BIN_DIR}/curl"
+
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PATH="${MOCK_BIN_DIR}:$PATH" \
+        "$PT_SCRIPT" update
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Updating Process Triage to v"* ]]
+}
+
+@test "wrapper: update resolves latest version and fetches matching installer" {
+    local curl_log="${TEST_DIR}/curl.log"
+
+    cat > "${MOCK_BIN_DIR}/curl" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${PT_CURL_LOG:?PT_CURL_LOG must be set}"
+url="${@: -1}"
+printf '%s\n' "$url" >> "$PT_CURL_LOG"
+
+if [[ "$url" == *"/main/VERSION" ]]; then
+  echo "9.9.9"
+  exit 0
+fi
+
+if [[ "$url" == *"/v9.9.9/install.sh" ]]; then
+  cat <<'INSTALLER'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${VERIFY:-}" != "1" ]]; then
+  echo "VERIFY missing" >&2
+  exit 44
+fi
+exit 0
+INSTALLER
+  exit 0
+fi
+
+echo "unexpected url: $url" >&2
+exit 31
+EOF
+    chmod +x "${MOCK_BIN_DIR}/curl"
+
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_CURL_LOG="$curl_log" \
+        PATH="${MOCK_BIN_DIR}:$PATH" \
+        "$PT_SCRIPT" update
+
+    [ "$status" -eq 0 ]
+    grep -q '/main/VERSION' "$curl_log"
+    grep -q '/v9.9.9/install.sh' "$curl_log"
+}
+
+@test "wrapper: update rejects unsafe version metadata and falls back safely" {
+    local curl_log="${TEST_DIR}/curl.log"
+
+    cat > "${MOCK_BIN_DIR}/curl" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${PT_CURL_LOG:?PT_CURL_LOG must be set}"
+url="${@: -1}"
+printf '%s\n' "$url" >> "$PT_CURL_LOG"
+
+if [[ "$url" == *"/main/VERSION" ]]; then
+  echo "9.9.9;injected"
+  exit 0
+fi
+
+if [[ "$url" == *"/v${PT_WRAPPER_VERSION}/install.sh" ]]; then
+  cat <<'INSTALLER'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${VERIFY:-}" != "1" ]]; then
+  echo "VERIFY missing" >&2
+  exit 44
+fi
+exit 0
+INSTALLER
+  exit 0
+fi
+
+echo "unexpected url: $url" >&2
+exit 31
+EOF
+    chmod +x "${MOCK_BIN_DIR}/curl"
+
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_WRAPPER_VERSION="$PT_WRAPPER_VERSION" \
+        PT_CURL_LOG="$curl_log" \
+        PATH="${MOCK_BIN_DIR}:$PATH" \
+        "$PT_SCRIPT" update
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Warning: could not resolve latest VERSION; falling back to v${PT_WRAPPER_VERSION} installer."* ]]
+    [[ "$output" == *"Updating Process Triage to v${PT_WRAPPER_VERSION}..."* ]]
+    grep -q '/main/VERSION' "$curl_log"
+    grep -q "/v${PT_WRAPPER_VERSION}/install.sh" "$curl_log"
+    if grep -q '/v9.9.9;injected/install.sh' "$curl_log"; then
+        fail "unexpected injected installer URL should never be requested"
+    fi
+}

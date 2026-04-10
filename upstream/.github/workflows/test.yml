@@ -1,0 +1,469 @@
+name: Test Suite
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+# Cancel in-progress runs when a new commit is pushed to the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Commit info for artifact naming
+  COMMIT_SHA_SHORT: ${{ github.sha }}
+  # Allow referencing in artifact names
+  ARTIFACT_PREFIX: pt-${{ github.run_number }}-${{ github.sha }}
+
+jobs:
+  # ==========================================================================
+  # Unit Tests - cargo test --workspace
+  # ==========================================================================
+  unit-tests:
+    name: Unit Tests (${{ matrix.os }} / ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        rust: [stable, beta]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (${{ matrix.rust }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "crates -> target"
+          key: ${{ matrix.os }}-${{ matrix.rust }}
+
+      - name: Run unit tests
+        run: |
+          echo "::group::Running unit tests"
+          cargo test --workspace --lib --bins 2>&1 | tee test-output.log
+          echo "::endgroup::"
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-logs-${{ matrix.os }}-${{ matrix.rust }}-${{ github.sha }}
+          path: |
+            test-output.log
+            target/test-logs/
+          retention-days: 14
+
+  # ==========================================================================
+  # Integration Tests - cargo test --test 'cli_*'
+  # ==========================================================================
+  integration-tests:
+    name: Integration Tests (${{ matrix.os }} / ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        rust: [stable, beta]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (${{ matrix.rust }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "crates -> target"
+          key: ${{ matrix.os }}-${{ matrix.rust }}
+
+      - name: Build binaries first
+        run: cargo build --workspace
+
+      - name: Run CLI integration tests
+        run: |
+          echo "::group::Running integration tests"
+          cargo test --test 'cli_*' -- --test-threads=1 2>&1 | tee integration-output.log
+          echo "::endgroup::"
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-logs-${{ matrix.os }}-${{ matrix.rust }}-${{ github.sha }}
+          path: |
+            integration-output.log
+            target/test-logs/
+          retention-days: 14
+
+  # ==========================================================================
+  # E2E Tests - cargo test --test 'e2e_*'
+  # ==========================================================================
+  e2e-tests:
+    name: E2E Tests (${{ matrix.os }} / ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        rust: [stable, beta]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (${{ matrix.rust }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "crates -> target"
+          key: ${{ matrix.os }}-${{ matrix.rust }}
+
+      - name: Build binaries first
+        run: cargo build --workspace
+
+      - name: Run E2E workflow tests
+        run: |
+          echo "::group::Running E2E tests"
+          cargo test --test 'e2e_*' -- --test-threads=1 2>&1 | tee e2e-output.log
+          echo "::endgroup::"
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-test-logs-${{ matrix.os }}-${{ matrix.rust }}-${{ github.sha }}
+          path: |
+            e2e-output.log
+            target/test-logs/
+          retention-days: 14
+
+  # ==========================================================================
+  # E2E Runner Harness - Full JSONL artifact collection
+  # ==========================================================================
+  e2e-runner-harness:
+    name: E2E Runner Harness (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "crates -> target"
+
+      - name: Install Bash 5 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install bash
+          echo "/opt/homebrew/bin" >> $GITHUB_PATH
+          /opt/homebrew/bin/bash --version
+
+      - name: Install BATS
+        run: |
+          git clone --depth 1 https://github.com/bats-core/bats-core.git
+          cd bats-core
+          sudo ./install.sh /usr/local
+
+      - name: Install gum (optional)
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo mkdir -p /etc/apt/keyrings
+            curl -fsSL https://repo.charm.sh/apt/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/charm.gpg
+            echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" | sudo tee /etc/apt/sources.list.d/charm.list
+            sudo apt update && sudo apt install -y gum
+          else
+            brew install gum
+          fi
+        continue-on-error: true
+
+      - name: Build binaries first
+        run: cargo build --workspace
+
+      - name: Run E2E runner harness
+        run: |
+          echo "::group::Running E2E runner harness"
+          chmod +x test/e2e_runner.sh
+          ./test/e2e_runner.sh 2>&1 | tee e2e-harness-output.log || true
+          echo "::endgroup::"
+        env:
+          TERM: xterm-256color
+          ARTIFACT_ROOT: target/test-logs/e2e
+
+      - name: Upload E2E JSONL logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-jsonl-logs-${{ matrix.os }}-${{ github.sha }}
+          path: |
+            target/test-logs/e2e/logs/
+          retention-days: 14
+
+      - name: Upload E2E plans
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-plans-${{ matrix.os }}-${{ github.sha }}
+          path: |
+            target/test-logs/e2e/plans/
+          retention-days: 14
+
+      - name: Upload E2E snapshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-snapshots-${{ matrix.os }}-${{ github.sha }}
+          path: |
+            target/test-logs/e2e/snapshots/
+          retention-days: 14
+
+      - name: Upload E2E telemetry
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-telemetry-${{ matrix.os }}-${{ github.sha }}
+          path: |
+            target/test-logs/e2e/telemetry/
+          retention-days: 14
+
+      - name: Upload E2E artifacts bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts-${{ matrix.os }}-${{ github.sha }}
+          path: |
+            target/test-logs/e2e/artifacts/
+          retention-days: 14
+
+      - name: Upload full E2E harness output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-harness-full-${{ matrix.os }}-${{ github.sha }}
+          path: |
+            e2e-harness-output.log
+            target/test-logs/e2e/
+          retention-days: 14
+
+  # ==========================================================================
+  # BATS Tests - bats test/
+  # ==========================================================================
+  bats-tests:
+    name: BATS Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Bash 5 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install bash
+          echo "/opt/homebrew/bin" >> $GITHUB_PATH
+          /opt/homebrew/bin/bash --version
+
+      - name: Install BATS
+        run: |
+          git clone --depth 1 https://github.com/bats-core/bats-core.git
+          cd bats-core
+          sudo ./install.sh /usr/local
+
+      - name: Install gum (optional)
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo mkdir -p /etc/apt/keyrings
+            curl -fsSL https://repo.charm.sh/apt/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/charm.gpg
+            echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" | sudo tee /etc/apt/sources.list.d/charm.list
+            sudo apt update && sudo apt install -y gum
+          else
+            brew install gum
+          fi
+        continue-on-error: true
+
+      - name: Run BATS tests
+        run: |
+          echo "::group::Running BATS tests"
+          bats --tap test/ 2>&1 | tee bats-output.log
+          echo "::endgroup::"
+        env:
+          TERM: xterm-256color
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bats-test-logs-${{ matrix.os }}-${{ github.sha }}
+          path: |
+            bats-output.log
+            test/
+          retention-days: 14
+
+  # ==========================================================================
+  # Schema Validation Tests
+  # ==========================================================================
+  schema-tests:
+    name: Schema Validation (ubuntu / stable)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "crates -> target"
+
+      - name: Build binaries first
+        run: cargo build --workspace
+
+      - name: Run schema validation tests
+        run: |
+          echo "::group::Running schema validation tests"
+          cargo test --test schema_validation 2>&1 | tee schema-output.log
+          echo "::endgroup::"
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: schema-test-logs-${{ github.sha }}
+          path: schema-output.log
+          retention-days: 14
+
+  # ==========================================================================
+  # Exit Code Tests
+  # ==========================================================================
+  exit-code-tests:
+    name: Exit Code Tests (ubuntu / stable)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "crates -> target"
+
+      - name: Build binaries first
+        run: cargo build --workspace
+
+      - name: Run exit code tests
+        run: |
+          echo "::group::Running exit code tests"
+          cargo test --test exit_codes_comprehensive 2>&1 | tee exitcode-output.log
+          echo "::endgroup::"
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exitcode-test-logs-${{ github.sha }}
+          path: exitcode-output.log
+          retention-days: 14
+
+  # ==========================================================================
+  # Test Timing Report
+  # ==========================================================================
+  timing-report:
+    name: Generate Timing Report
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [unit-tests, integration-tests, e2e-tests, e2e-runner-harness, bats-tests]
+    if: always()
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate timing summary
+        run: |
+          echo "# Test Timing Report" > timing-report.md
+          echo "" >> timing-report.md
+          echo "**Commit:** \`${{ github.sha }}\`" >> timing-report.md
+          echo "**Run:** #${{ github.run_number }}" >> timing-report.md
+          echo "**Generated at:** $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> timing-report.md
+          echo "" >> timing-report.md
+          echo "## Artifact Sizes" >> timing-report.md
+          echo "" >> timing-report.md
+          if [ -d artifacts ]; then
+            # E2E JSONL artifacts (highlighted)
+            echo "### E2E JSONL Artifacts" >> timing-report.md
+            for dir in artifacts/e2e-*/; do
+              if [ -d "$dir" ]; then
+                size=$(du -sh "$dir" | cut -f1)
+                name=$(basename "$dir")
+                echo "- $name: $size" >> timing-report.md
+              fi
+            done
+            echo "" >> timing-report.md
+            # Other test artifacts
+            echo "### Other Test Artifacts" >> timing-report.md
+            for dir in artifacts/*/; do
+              if [ -d "$dir" ]; then
+                name=$(basename "$dir")
+                # Skip e2e artifacts (already listed)
+                if [[ ! "$name" =~ ^e2e- ]]; then
+                  size=$(du -sh "$dir" | cut -f1)
+                  echo "- $name: $size" >> timing-report.md
+                fi
+              fi
+            done
+          fi
+          cat timing-report.md
+
+      - name: Upload timing report
+        uses: actions/upload-artifact@v4
+        with:
+          name: timing-report-${{ github.sha }}
+          path: timing-report.md
+          retention-days: 14
