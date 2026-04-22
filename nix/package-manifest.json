@@ -6,12 +6,12 @@
     "repo": "process_triage",
     "channel": "github-head",
     "defaultBranch": "main",
-    "version": "2.0.5",
+    "version": "0.1.0",
     "rev": "be277c09d7ea7e3f59f1924d549b52a81c400264",
     "hash": "sha256-wzlVw/KRxh49mlAJU6zXAMWNMEQTbG8hN50QE6YGgDI="
   },
   "package": {
-    "version": "2.0.5"
+    "version": "0.1.0"
   },
   "binary": {
     "name": "pt",
