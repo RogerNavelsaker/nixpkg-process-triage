@@ -7,8 +7,8 @@
     "channel": "github-head",
     "defaultBranch": "main",
     "version": "0.1.0",
-    "rev": "d98c440e13b35fead5ad6b9ed10ed0baf72dc430",
-    "hash": "sha256-Y08b7Yjopd1PiHX1b4zDFBzgDMp+4zE8C8UeHB+84yg="
+    "rev": "2b436190c753e27101d09ed5b5574a27f68520b1",
+    "hash": "sha256-+Zq1rIwPdf1wqALEgV1eIBgbzcFxP7MZ9q7yIyo/DDg="
   },
   "package": {
     "version": "0.1.0"
